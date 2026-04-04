@@ -459,14 +459,55 @@ def _zone_reward(
     else:
         # ------------------------------------------------------------------ #
         # Step 6 — Insufficient dispatch (partial or wrong)
+        #
+        # Partial Progress Gradient (max +0.90)
+        # -----------------------------------------------------------------------
+        # Without this, sending 4/5 required fire units yields exactly the same
+        # score as sending 0/5 — a flat, unclimbable cliff that prevents the RL
+        # policy from learning the correct threshold via gradient descent.
+        #
+        # The fulfilled ratio converts the binary check into a continuous signal:
+        #
+        #   fire_fulfilled = min(D_fire / R_fire, 1.0)   in [0.0, 1.0]
+        #   amb_fulfilled  = min(D_amb  / R_amb,  1.0)   in [0.0, 1.0]
+        #   partial_score  = fire_fulfilled * 0.45 + amb_fulfilled * 0.45
+        #                  in [0.0, 0.90]
+        #
+        # Examples:
+        #   4/5 fire units sent → fire_fulfilled=0.80 → partial_score += 0.36
+        #   0/5 fire units sent → fire_fulfilled=0.00 → partial_score += 0.00
+        #   exact traffic only  → only traffic component is scored above
+        #
+        # The HIGH-severity penalty is still applied on top of the partial score
+        # so under-dispatching a CATASTROPHIC fire still produces a net negative
+        # reward — the gradient exists but the sign remains punishing.
         # ------------------------------------------------------------------ #
+        fire_fulfilled = (
+            min(dispatch.dispatch_fire / r_fire, 1.0) if r_fire > 0 else 1.0
+        )
+        amb_fulfilled = (
+            min(dispatch.dispatch_ambulance / r_amb_effective, 1.0)
+            if r_amb_effective > 0
+            else 1.0
+        )
+        partial_score = (fire_fulfilled * 0.45) + (amb_fulfilled * 0.45)
+
+        if partial_score > 0.0:
+            logger.debug(
+                "[%s] Partial progress: fire_fulfilled=%.2f amb_fulfilled=%.2f "
+                "-> partial_score=+%.2f",
+                zone_id, fire_fulfilled, amb_fulfilled, partial_score,
+            )
+            zone_reward += partial_score
+
         is_high_severity = (
             zone.fire in (FireLevel.HIGH, FireLevel.CATASTROPHIC)
             or zone.patient == PatientLevel.CRITICAL
         )
         if is_high_severity:
             logger.debug(
-                "[%s] Insufficient dispatch on high-severity incident → DELAYED_HIGH_SEVERITY (%.1f)",
+                "[%s] Insufficient dispatch on high-severity incident "
+                "-> DELAYED_HIGH_SEVERITY (%.1f)",
                 zone_id, RewardConstants.DELAYED_HIGH_SEVERITY,
             )
             zone_reward += RewardConstants.DELAYED_HIGH_SEVERITY  # -5.0
