@@ -171,7 +171,19 @@ _ACTION_SCHEMA: Dict[str, Any] = {
                 },
                 "required": ["dispatch_fire", "dispatch_ambulance", "control_traffic"],
             },
-        }
+        },
+        "public_broadcast_message": {
+            "type": ["string", "null"],
+            "description": (
+                "Optional natural-language warning issued to citizens. "
+                "REQUIRED when any zone has HIGH/CATASTROPHIC fire or CRITICAL "
+                "patients. MUST name the specific zone, the hazard type "
+                "(fire/medical), and include a directive verb "
+                "('evacuate', 'shelter', 'avoid', 'warning'). "
+                "Example: 'ALERT: Downtown has a CATASTROPHIC fire. "
+                "All residents must evacuate immediately.'"
+            ),
+        },
     },
     "required": ["allocations"],
 }

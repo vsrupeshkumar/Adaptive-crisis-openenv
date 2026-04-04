@@ -661,6 +661,113 @@ def calculate_step_reward(
 
 
 # ---------------------------------------------------------------------------
+# Context-Grounded Semantic Grader — NLP broadcast bonus
+# ---------------------------------------------------------------------------
+
+def calculate_nlp_bonus(message: str, current_state: Observation) -> float:
+    """Evaluate the agent's public broadcast message against the current crisis state.
+
+    **Context-Grounded Semantic Grader** — Design Philosophy
+    ---------------------------------------------------------
+    A naive reward (+0.5 if message non-empty) creates a free-rider
+    vulnerability: the agent learns to output ``"hello"`` and pocket the bonus
+    without providing any real public-safety value.
+
+    This grader prevents that by anchoring the bonus to the *content* of the
+    message relative to what is objectively happening in the simulation.  The
+    score is a three-component additive matrix that rewards specificity and
+    penalises generic text by withholding partial scores for each missing element.
+
+    Scoring Matrix (max 1.0 points)
+    --------------------------------
+    +----------------------------------+-------+----------------------------------+
+    | Component                        | Score | Condition                        |
+    +==================================+=======+==================================+
+    | Base Match (zone name)           |  0.4  | message.lower() contains zone ID |
+    +----------------------------------+-------+----------------------------------+
+    | Hazard Match (keyword)           |  0.3  | fire critical: fire/blaze/burn   |
+    |                                  |       | medical critical: medical/hospital|
+    +----------------------------------+-------+----------------------------------+
+    | Action Match (directive verb)    |  0.3  | evacuate/shelter/avoid/warning   |
+    +----------------------------------+-------+----------------------------------+
+
+    Anti-cheating properties
+    ------------------------
+    * Message must name the CORRECT zone for Base Match (wrong zone = 0).
+    * Hazard keywords are TYPE-specific (fire vs medical, not interchangeable).
+    * All three components are independent: possible scores are any subset.
+
+    This is a **pure function** — no side-effects, deterministic.
+
+    Args:
+        message:       The agent's public_broadcast_message string.
+        current_state: The current Observation used to ground keyword checks.
+
+    Returns:
+        A float in ``[0.0, 1.0]`` representing the graded broadcast quality.
+    """
+    if not message:
+        return 0.0
+
+    msg_lower = message.lower()
+
+    # ---- Identify the most critical zone ----------------------------------- #
+    best_score = 0
+    critical_zone_id: str = ""
+    critical_is_fire: bool = True
+
+    for zone_id, z in current_state.zones.items():
+        zone_severity = 0
+        zone_fire_critical = True
+        if z.fire == FireLevel.CATASTROPHIC:
+            zone_severity = 100
+        elif z.fire == FireLevel.HIGH:
+            zone_severity = 50
+        if z.patient == PatientLevel.CRITICAL:
+            if 80 > zone_severity:
+                zone_severity = 80
+                zone_fire_critical = False
+        if zone_severity > best_score:
+            best_score = zone_severity
+            critical_zone_id = zone_id
+            critical_is_fire = zone_fire_critical
+
+    if not critical_zone_id or best_score == 0:
+        return 0.0
+
+    nlp_score: float = 0.0
+
+    # ---- Component 1: Base Match (0.4) ------------------------------------- #
+    if critical_zone_id.lower() in msg_lower:
+        nlp_score += 0.4
+        logger.debug("NLP Base Match: '%s' found in message -> +0.4", critical_zone_id)
+
+    # ---- Component 2: Hazard Match (0.3) ----------------------------------- #
+    if critical_is_fire:
+        fire_keywords = {"fire", "blaze", "burn", "flames", "inferno"}
+        if any(kw in msg_lower for kw in fire_keywords):
+            nlp_score += 0.3
+            logger.debug("NLP Hazard Match (fire): keyword found -> +0.3")
+    else:
+        medical_keywords = {"medical", "hospital", "injury", "casualty", "patient", "ambulance"}
+        if any(kw in msg_lower for kw in medical_keywords):
+            nlp_score += 0.3
+            logger.debug("NLP Hazard Match (medical): keyword found -> +0.3")
+
+    # ---- Component 3: Action Match (0.3) ----------------------------------- #
+    directive_verbs = {"evacuate", "shelter", "avoid", "warning", "alert", "flee", "leave"}
+    if any(verb in msg_lower for verb in directive_verbs):
+        nlp_score += 0.3
+        logger.debug("NLP Action Match: directive verb found -> +0.3")
+
+    logger.info(
+        "NLP Grader: critical_zone=%s is_fire=%s msg=%r -> bonus=%.1f",
+        critical_zone_id, critical_is_fire, message[:60], nlp_score,
+    )
+    return nlp_score
+
+
+# ---------------------------------------------------------------------------
 # Backward-compatibility shim — environment.py calls compute_reward()
 # ---------------------------------------------------------------------------
 
@@ -671,16 +778,26 @@ def compute_reward(
 ) -> tuple[float, bool]:
     """Backward-compatible wrapper used by ``environment.py``.
 
-    Delegates to ``calculate_step_reward`` with full Trajectory-Aware shaping
-    when ``previous_state`` is supplied, or falls back to the current
-    observation as the prior (zero Δ, no shaping) when it is not.
+    Applies three independent reward layers:
+
+    1. **Dispatch Quality** (``calculate_step_reward`` -> ``_zone_reward``)
+       Numeric dispatch decisions evaluated against incident requirements.
+    2. **Trajectory Shaping** (``_trajectory_shaping``)
+       Delta-severity bonus/penalty across consecutive steps.
+    3. **Context-Grounded Semantic Grader** (``calculate_nlp_bonus``)
+       Evaluates the quality of the agent's natural-language broadcast
+       message against the actual crisis state.  Scores 0-1.0 only when
+       a HIGH/CATASTROPHIC fire or CRITICAL patient is active.
+       Max +1.0 bonus per step. Components:
+         - Zone name present in message   -> +0.4
+         - Correct hazard keyword present -> +0.3
+         - Directive verb present         -> +0.3
+       Prevents free-rider hacks by requiring semantically grounded text.
 
     Args:
         action:         Agent's dispatch action.
         obs:            Current observation (pre-resolution).
-        previous_state: Optional previous-step observation.  When provided,
-                        enables Stabilization Bonus and Degradation Penalty
-                        calculations.  Defaults to ``None`` (no shaping).
+        previous_state: Optional previous-step observation for shaping.
 
     Returns:
         ``(total_reward, all_resolved)`` where ``all_resolved`` is ``True``
@@ -693,6 +810,20 @@ def compute_reward(
         previous_state=prior,
     )
 
+    # ---- Layer 3: Context-Grounded Semantic Grader (NLP broadcast bonus) -- #
+    # Gate: only award when there is an active HIGH/CATASTROPHIC fire OR a
+    # CRITICAL patient.  Outside of crisis conditions the broadcast is
+    # irrelevant — granting a bonus here would reward unnecessary scaremongering.
+    has_high_severity = any(
+        z.fire in (FireLevel.HIGH, FireLevel.CATASTROPHIC)
+        or z.patient == PatientLevel.CRITICAL
+        for z in obs.zones.values()
+    )
+    if has_high_severity and action.public_broadcast_message:
+        nlp_bonus = calculate_nlp_bonus(action.public_broadcast_message, obs)
+        total_reward += nlp_bonus
+        logger.debug("Layer 3 NLP bonus applied: +%.2f", nlp_bonus)
+
     # Derive all_resolved: True only if every zone had no active incidents
     # OR the dispatch was sufficient for all zones.
     all_resolved = True
@@ -702,7 +833,7 @@ def compute_reward(
         needs_traffic = zone_state.traffic in (TrafficLevel.HEAVY, TrafficLevel.GRIDLOCK)
 
         if r_fire == 0 and r_amb == 0 and not needs_traffic:
-            continue  # Zone is clear — no response needed.
+            continue  # Zone is clear - no response needed.
 
         dispatch = action.allocations.get(zone_id, ZoneDispatch())
         amb_gridlock = (
