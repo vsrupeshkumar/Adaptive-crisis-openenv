@@ -11,12 +11,16 @@ Design Principles
 * **Pure function** — ``calculate_step_reward`` has no side-effects and
   depends only on its arguments.  This makes it trivially unit-testable and
   deterministic.
+* **Trajectory-Aware Reward Shaping** — the function now utilises the
+  ``previous_state`` argument to compute *Δ-severity signals* across two
+  consecutive steps.  These signals reward containment (stopping a cascade)
+  and punish control failures (letting an incident escalate).
 * **Backward-compatible shim** — ``compute_reward`` is retained as an alias
   so that ``environment.py``, which already imports it, continues to work
   without modification.
 
-Reward Table (exact specification)
-------------------------------------
+Reward Table (Step-Level Signals)
+----------------------------------
 +-------------------------------------------------------+--------+
 | Event                                                 | Points |
 +=======================================================+========+
@@ -33,6 +37,44 @@ Reward Table (exact specification)
 +-------------------------------------------------------+--------+
 | Ignoring incident (do-nothing while incidents pend)   | -4.0   |
 +-------------------------------------------------------+--------+
+
+Trajectory-Aware Δ-Severity Signals (novel dense shaping)
+-----------------------------------------------------------
++-------------------------------------------------------+--------+
+| Stabilization Bonus: incident was escalating          |        |
+|   last step, severity held stable this step           | +2.0   |
++-------------------------------------------------------+--------+
+| Degradation Penalty: incident severity *increased*    |        |
+|   between previous_state and current_state            | -3.0   |
++-------------------------------------------------------+--------+
+
+Stabilization Bonus — Design Rationale
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+An RL agent that dispatches *just enough* to stop a cascading incident
+deserves more reward than one that throws excessive resources at an
+already-resolved zone.  The stabilization bonus detects this by comparing
+the zone's severity across **two** consecutive timesteps:
+
+    Δ = ordinal_rank(current_severity) - ordinal_rank(previous_severity)
+
+    If Δ == 0  AND  ordinal_rank(previous_severity) > ordinal_rank(the step
+    before that)  → the agent halted the degradation.  Grant +2.0.
+
+Because the environment only exposes the *immediately* previous state, we
+proxy "was escalating in the prior step" by checking whether any zone already
+had a *consecutive_failures* count > 0 at the start of the current step (this
+is set by ``_resolve_zone`` when the previous action was insufficient).
+
+Degradation Penalty — Design Rationale
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Granting a penalty whenever an incident's ordinal severity rank *increases*
+between ``previous_state`` and ``current_state`` provides an early, dense
+punishment signal for inaction or under-dispatch.  Without this, the agent
+must wait for the sparse cascade event (3+ consecutive failures) before
+receiving a meaningful negative gradient.
+
+    If ordinal_rank(current_severity) > ordinal_rank(previous_severity)
+    → apply DEGRADATION_PENALTY = -3.0.
 
 Mathematical Definitions
 ------------------------
@@ -65,7 +107,7 @@ incentive pushes toward minimal sufficient dispatch.
 from __future__ import annotations
 
 import logging
-from typing import Tuple, Dict
+from typing import Dict, Optional, Tuple
 
 from env.models import (
     Action,
@@ -125,6 +167,31 @@ class RewardConstants:
     #: at least one active incident exists in that zone.
     IGNORE_INCIDENT: float = -4.0
 
+    # ---------------------------------------------------------------------------
+    # Trajectory-Aware Reward Shaping constants
+    # ---------------------------------------------------------------------------
+
+    #: Bonus granted when a zone's incident severity was actively escalating
+    #: (consecutive_failures > 0 in the previous state) but the agent's
+    #: dispatch this step successfully **halted** the degradation trajectory
+    #: (severity rank Δ == 0 between previous_state and current_state).
+    #:
+    #: Design rationale: containment — stopping a cascade before it becomes
+    #: catastrophic — is the single most valuable action in crisis management.
+    #: This bonus incentivises the agent to prioritise *deteriorating* zones
+    #: even when their current severity looks manageable.
+    STABILIZATION_BONUS: float = 2.0
+
+    #: Penalty applied per zone when any incident's ordinal severity rank
+    #: *increases* between ``previous_state.zones[z]`` and
+    #: ``current_state.zones[z]``.
+    #:
+    #: Design rationale: without this dense signal the agent must wait for the
+    #: sparse cascade event (three consecutive failures) before receiving a
+    #: meaningful negative gradient.  A -3.0 early-warning penalty pushes the
+    #: policy toward proactive dispatch rather than reactive damage control.
+    DEGRADATION_PENALTY: float = -3.0
+
     # --- Retained from original implementation (used by environment.py) ---
     #: Additional weather-based fire friction modifiers.
     WEATHER_HURRICANE_FIRE_FRICTION: int = 2
@@ -132,6 +199,29 @@ class RewardConstants:
 
     #: Ambulance modifier when GRIDLOCK traffic is present and no police sent.
     GRIDLOCK_AMB_FRICTION: int = 2
+
+
+# ---------------------------------------------------------------------------
+# Ordinal severity maps — enable integer arithmetic over enum ranks
+# ---------------------------------------------------------------------------
+
+#: Ascending ordinal rank for fire severity. Used by the trajectory-shaping
+#: helper to compute Δ-severity as a signed integer.
+_FIRE_RANK: Dict[FireLevel, int] = {
+    FireLevel.NONE:         0,
+    FireLevel.LOW:          1,
+    FireLevel.MEDIUM:       2,
+    FireLevel.HIGH:         3,
+    FireLevel.CATASTROPHIC: 4,
+}
+
+#: Ascending ordinal rank for patient severity.
+_PATIENT_RANK: Dict[PatientLevel, int] = {
+    PatientLevel.NONE:     0,
+    PatientLevel.MODERATE: 1,
+    PatientLevel.CRITICAL: 2,
+    PatientLevel.FATAL:    3,  # FATAL is the worst outcome; rank it highest.
+}
 
 
 # ---------------------------------------------------------------------------
@@ -385,23 +475,146 @@ def _zone_reward(
 
 
 # ---------------------------------------------------------------------------
+# Trajectory-Aware Shaping — pure Δ-severity helper
+# ---------------------------------------------------------------------------
+
+def _trajectory_shaping(
+    zone_id: str,
+    current_zone: ZoneState,
+    previous_zone: ZoneState,
+) -> float:
+    """Δ-severity shaping: Stabilization Bonus and Degradation Penalty.
+
+    **Trajectory-Aware Reward Shaping** computes the difference in ordinal
+    severity rank between two consecutive observations of the same zone and
+    translates that Δ into a signed shaping bonus or penalty.
+
+    This is a **pure function** — no side-effects, deterministic.
+
+    Algorithm
+    ---------
+    For each incident type (fire, patient) in the zone:
+
+    1.  Compute Δ_fire = _FIRE_RANK[current.fire] - _FIRE_RANK[previous.fire]
+        Compute Δ_patient = _PATIENT_RANK[current.patient] - _PATIENT_RANK[previous.patient]
+
+    2.  **Degradation Penalty** (``Δ > 0``):
+        The incident escalated between steps.  This indicates the previous
+        dispatch was insufficient (or the zone was ignored entirely).  We
+        apply ``DEGRADATION_PENALTY = -3.0`` immediately so the agent can
+        learn from the gradient before the cascade event fires.
+
+    3.  **Stabilization Bonus** (``Δ == 0`` AND the zone was previously
+        deteriorating, indicated by ``previous_zone.consecutive_failures > 0``):
+        The agent halted a worsening trajectory without necessarily resolving
+        the incident outright.  This is the hardest skill to learn — knowing
+        exactly how many resources to send to stop (but not over-respond to) a
+        cascading incident.  We reward it with ``STABILIZATION_BONUS = +2.0``.
+
+    When Δ < 0 (severity *decreased*) no shaping is applied here because
+    the base ``_zone_reward`` already grants CORRECT_ALLOCATION (+2.0) and
+    optionally SAVE_CRITICAL_CASE (+5.0) for successful resolution.
+
+    Args:
+        zone_id:       Zone name (for debug logging only).
+        current_zone:  Zone state in the *current* step observation.
+        previous_zone: Zone state in the *previous* step observation.
+
+    Returns:
+        A float representing the net shaping bonus/penalty for this zone.
+        Typical range: ``[-3.0, +2.0]`` per zone.
+    """
+    rc = RewardConstants
+    shaping: float = 0.0
+
+    # ---- Fire severity delta ----------------------------------------------- #
+    delta_fire = _FIRE_RANK[current_zone.fire] - _FIRE_RANK[previous_zone.fire]
+
+    if delta_fire > 0:
+        # Fire severity *increased* — the agent's previous action failed to
+        # contain the blaze.  Apply the dense degradation penalty immediately.
+        logger.debug(
+            "[%s] Fire degraded (%s → %s, Δ=%d) → DEGRADATION_PENALTY (%.1f)",
+            zone_id,
+            previous_zone.fire.value, current_zone.fire.value,
+            delta_fire, rc.DEGRADATION_PENALTY,
+        )
+        shaping += rc.DEGRADATION_PENALTY
+
+    elif delta_fire == 0 and previous_zone.consecutive_failures > 0 and current_zone.fire != FireLevel.NONE:
+        # Fire severity *held steady* while the zone was previously deteriorating
+        # (consecutive_failures > 0 means the prior step was insufficient).
+        # This indicates the agent's current dispatch successfully stabilised the
+        # fire — halting the cascade trajectory.
+        logger.debug(
+            "[%s] Fire stabilized (level=%s, prev_failures=%d) → STABILIZATION_BONUS (+%.1f)",
+            zone_id,
+            current_zone.fire.value, previous_zone.consecutive_failures, rc.STABILIZATION_BONUS,
+        )
+        shaping += rc.STABILIZATION_BONUS
+
+    # ---- Patient severity delta -------------------------------------------- #
+    delta_patient = _PATIENT_RANK[current_zone.patient] - _PATIENT_RANK[previous_zone.patient]
+
+    if delta_patient > 0:
+        logger.debug(
+            "[%s] Patient status degraded (%s → %s, Δ=%d) → DEGRADATION_PENALTY (%.1f)",
+            zone_id,
+            previous_zone.patient.value, current_zone.patient.value,
+            delta_patient, rc.DEGRADATION_PENALTY,
+        )
+        shaping += rc.DEGRADATION_PENALTY
+
+    elif (
+        delta_patient == 0
+        and previous_zone.consecutive_failures > 0
+        and current_zone.patient not in (PatientLevel.NONE, PatientLevel.FATAL)
+    ):
+        logger.debug(
+            "[%s] Patient stabilized (level=%s, prev_failures=%d) → STABILIZATION_BONUS (+%.1f)",
+            zone_id,
+            current_zone.patient.value, previous_zone.consecutive_failures, rc.STABILIZATION_BONUS,
+        )
+        shaping += rc.STABILIZATION_BONUS
+
+    return shaping
+
+
+# ---------------------------------------------------------------------------
 # Public API — the primary dense reward function
 # ---------------------------------------------------------------------------
 
 def calculate_step_reward(
     current_state: Observation,
     action: Action,
-    previous_state: Observation,  # noqa: ARG001 — reserved for future shaping
+    previous_state: Observation,
 ) -> float:
     """Compute a dense scalar reward for a single simulation step.
 
-    This is the **primary public interface** of this module. It is a **pure
+    This is the **primary public interface** of this module.  It is a **pure
     function** — calling it twice with identical arguments always produces the
     same result, and it has no observable side-effects.
 
-    The reward is computed by summing per-zone contributions evaluated
-    independently via ``_zone_reward``.  See module docstring for the complete
-    reward table.
+    The reward is computed in two independent layers that are summed:
+
+    **Layer 1 — Instantaneous Dispatch Quality** (per-zone via ``_zone_reward``)
+        Evaluates whether the agent's *current* dispatch is correct, wasteful,
+        efficient, or absent relative to this step's observed incident levels.
+        Signals: CORRECT_ALLOCATION, OVER_ALLOCATION, EFFICIENT_RESOLUTION,
+        IGNORE_INCIDENT, DELAYED_HIGH_SEVERITY, SAVE_CRITICAL_CASE.
+
+    **Layer 2 — Trajectory-Aware Δ-Severity Shaping** (per-zone via
+        ``_trajectory_shaping``)
+        Evaluates how the world *changed* between the previous step and this
+        step, providing an early dense gradient signal for containment vs.
+        escalation.  Signals: STABILIZATION_BONUS (+2.0), DEGRADATION_PENALTY
+        (-3.0).
+
+    The two layers are designed to be complementary:
+    * Layer 1 rewards the agent for *what it does*.
+    * Layer 2 rewards the agent for *the consequences of what it did*.
+    Together they create a rich, non-sparse gradient landscape that guides
+    policy learning far more efficiently than terminal-only reward.
 
     Args:
         current_state:  The ``Observation`` *after* the tick (step counter has
@@ -409,23 +622,41 @@ def calculate_step_reward(
                         the environment.  This is the state the agent observed
                         when selecting ``action``.
         action:         The dispatch action selected by the agent this step.
-        previous_state: The ``Observation`` from the *previous* step.  Retained
-                        for future temporal shaping (e.g., rewarding sustained
-                        improvement), but not used in the current formula.
+        previous_state: The ``Observation`` from the *previous* episode step.
+                        Used by the trajectory-shaping layer to compute Δ.
+                        On step 1 this is the pre-tick snapshot of the initial
+                        observation (a valid fallback with no cascades yet).
 
     Returns:
-        A floating-point scalar reward. There are no explicit bounds, but
-        practical per-step values lie roughly in ``[-9.0, +8.0]`` per zone.
+        A floating-point scalar reward.  Practical per-step values lie roughly
+        in ``[-12.0, +10.0]`` per zone (base range ± shaping additive).
     """
     total_reward = 0.0
 
     for zone_id, zone_state in current_state.zones.items():
         dispatch: ZoneDispatch = action.allocations.get(zone_id, ZoneDispatch())
-        contribution = _zone_reward(zone_id, zone_state, dispatch, current_state)
-        logger.debug("[%s] Zone reward contribution: %.2f", zone_id, contribution)
-        total_reward += contribution
 
-    logger.info("Step reward: %.4f (active zones: %d)", total_reward, len(current_state.zones))
+        # ---- Layer 1: Instantaneous dispatch quality ----------------------- #
+        base_contribution = _zone_reward(zone_id, zone_state, dispatch, current_state)
+
+        # ---- Layer 2: Trajectory-Aware Δ-severity shaping ----------------- #
+        # Retrieve the matching zone from the previous step.  If the zone did
+        # not exist in the prior observation (e.g., dynamically spawned), we
+        # fall back to the current state, producing a Δ of zero (no shaping).
+        prev_zone_state: ZoneState = previous_state.zones.get(zone_id, zone_state)
+        shaping_contribution = _trajectory_shaping(zone_id, zone_state, prev_zone_state)
+
+        zone_total = base_contribution + shaping_contribution
+        logger.debug(
+            "[%s] base=%.2f | shaping=%.2f | zone_total=%.2f",
+            zone_id, base_contribution, shaping_contribution, zone_total,
+        )
+        total_reward += zone_total
+
+    logger.info(
+        "Step reward: %.4f (active zones: %d, includes trajectory shaping)",
+        total_reward, len(current_state.zones),
+    )
     return total_reward
 
 
@@ -433,25 +664,33 @@ def calculate_step_reward(
 # Backward-compatibility shim — environment.py calls compute_reward()
 # ---------------------------------------------------------------------------
 
-def compute_reward(action: Action, obs: Observation) -> tuple[float, bool]:
+def compute_reward(
+    action: Action,
+    obs: Observation,
+    previous_state: Optional[Observation] = None,
+) -> tuple[float, bool]:
     """Backward-compatible wrapper used by ``environment.py``.
 
-    Delegates to ``calculate_step_reward`` and derives ``all_resolved`` by
-    checking whether any zone still has active incidents after the reward
-    computation.
+    Delegates to ``calculate_step_reward`` with full Trajectory-Aware shaping
+    when ``previous_state`` is supplied, or falls back to the current
+    observation as the prior (zero Δ, no shaping) when it is not.
 
     Args:
-        action: Agent's dispatch action.
-        obs:    Current observation (pre-resolution).
+        action:         Agent's dispatch action.
+        obs:            Current observation (pre-resolution).
+        previous_state: Optional previous-step observation.  When provided,
+                        enables Stabilization Bonus and Degradation Penalty
+                        calculations.  Defaults to ``None`` (no shaping).
 
     Returns:
         ``(total_reward, all_resolved)`` where ``all_resolved`` is ``True``
         if no zone had an unmet requirement at this step.
     """
+    prior = previous_state if previous_state is not None else obs
     total_reward = calculate_step_reward(
         current_state=obs,
         action=action,
-        previous_state=obs,  # No previous state available via this shim.
+        previous_state=prior,
     )
 
     # Derive all_resolved: True only if every zone had no active incidents

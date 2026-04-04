@@ -53,18 +53,39 @@ efficiency (weight 0.30):
 
 resource_usage (weight 0.20):
     Measures how efficiently resources were used — penalising wasted dispatches
-    and over-allocation throughout the episode.
+    and over-allocation throughout the episode, using a **Severity-Weighted
+    Resource Penalty** model.
 
-        resource_usage = 1.0 - clamp(wasted_dispatches / max_possible_waste)
+    **Severity-Weighted Waste Philosophy**
+    At each simulation step the environment computes the *minimum units required*
+    for each zone (``req_fire``, ``req_ambulance``).  Any units dispatched *above*
+    that minimum are "wasted".  However, not all waste is equally egregious:
 
-    ``wasted_dispatches`` is tracked by the environment as the running count
-    of over-allocation events (steps where D > R for at least one resource).
-    ``max_possible_waste`` is defined as:
+    * Over-dispatching to a **LOW / NONE** fire zone = **×2.0 penalty per unit**.
+      The zone was calm; there was no rational justification for excess units.
+      Wasting scarce resources here maximally harms the rest of the city.
 
-        max_possible_waste = total_steps × len(zones)
+    * Over-dispatching to a **MEDIUM** fire zone = **×1.0 penalty per unit**.
+      Moderate over-insurance; the zone posed a real but containable threat.
 
-    A value of 1.0 means perfect resource usage (zero waste); 0.0 means every
-    step in every zone was an over-allocation.
+    * Over-dispatching to a **HIGH / CATASTROPHIC** fire zone = **×0.5 penalty per unit**.
+      Forgivable safety buffer — the stakes were high and a hedge is reasonable.
+      Ambulance dispatches to **CRITICAL** patients use the same 0.5 multiplier.
+
+    The same multiplier table applies to ambulance over-dispatches based on
+    ``PatientLevel``.
+
+    The accumulated float ``wasted_dispatches`` is normalised against a
+    dynamically computed ``max_allowable_waste``:
+
+        MAX_WASTE_PER_INCIDENT = 5.0   # theoretical worst-case waste per incident
+        max_allowable_waste    = total_incidents × MAX_WASTE_PER_INCIDENT
+        resource_usage         = max(0.0, 1.0 - (wasted_dispatches / max_allowable_waste))
+
+    Anchoring to ``total_incidents`` rather than ``total_steps × num_zones`` makes
+    the metric scale naturally with problem difficulty: a 10-incident episode and
+    a 2-incident episode are evaluated on the same proportional waste standard,
+    regardless of how long each took.
 
     If ``wasted_dispatches`` is not tracked (legacy call), resource_usage
     defaults conservatively to 0.5.
@@ -112,6 +133,16 @@ class GraderConfig:
     # Efficiency normalisation anchors (see module docstring)
     OPTIMAL_REWARD_PER_INCIDENT: float  =  8.0  # best achievable per incident
     WORST_REWARD_PER_INCIDENT:   float  = -9.0  # worst possible per incident
+
+    # Severity-Weighted Waste normalisation anchor (see module docstring).
+    # Represents the theoretical maximum accumulated waste penalty per incident
+    # in a single episode assuming the agent always over-dispatches at the
+    # worst possible severity level (weight=2.0) by the maximum clamped
+    # dispatch count (50 units).  We use a conservative value of 5.0, which
+    # corresponds to roughly 2–3 excess units at the highest (2.0×) weight.
+    # This keeps the denominator proportional to problem difficulty rather than
+    # episode length, ensuring fair comparison across task difficulties.
+    MAX_WASTE_PER_INCIDENT: float = 5.0
 
 
 # Sanity-check the weights — fail fast at import time if misconfigured.
@@ -221,25 +252,61 @@ def _compute_efficiency(total_reward: float, total_incidents: int) -> float:
 
 
 def _compute_resource_usage(
-    wasted_dispatches: Optional[int],
+    wasted_dispatches: Optional[float],
     total_steps: int,
     num_zones: int,
+    total_incidents: int = 0,
 ) -> float:
-    """Normalised resource efficiency score (1.0 = no waste, 0.0 = maximum waste).
+    """Normalised resource efficiency score using the Severity-Weighted Waste model.
 
-    Mathematical definition:
-        max_possible_waste = total_steps × num_zones
-        resource_usage     = 1.0 - clamp(wasted / max_possible_waste)
+    **Severity-Weighted Resource Penalty** — design philosophy
+    ----------------------------------------------------------
+    The environment accumulates ``wasted_dispatches`` as a *continuous float*,
+    not a binary event counter.  Each excess unit dispatched above the computed
+    requirement contributes a severity-scaled penalty:
 
-    A "wasted dispatch" is any step-zone combination where the agent dispatched
-    more units than were required (over-allocation), as tracked by the
-    environment's ``OVER_ALLOCATION`` reward event.
+    +------------------------------+---------------------------+
+    | Incident severity            | Penalty weight per unit   |
+    +==============================+===========================+
+    | NONE / LOW fire   or         |                           |
+    |   NONE / FATAL patient       | ×2.0  (most egregious)    |
+    +------------------------------+---------------------------+
+    | MEDIUM fire or               |                           |
+    |   MODERATE patient           | ×1.0  (moderate waste)    |
+    +------------------------------+---------------------------+
+    | HIGH / CATASTROPHIC fire or  |                           |
+    |   CRITICAL patient           | ×0.5  (forgivable buffer) |
+    +------------------------------+---------------------------+
+
+    This means a perfect agent dispatching exactly the required units scores
+    1.0, while an agent recklessly flooding calm zones with excess units is
+    penalised far more harshly than one taking a small safety buffer on a
+    CATASTROPHIC fire.
+
+    **Normalisation**
+    -----------------
+    Rather than using ``total_steps × num_zones`` (which would unfairly punish
+    longer episodes carrying the same number of incidents), we anchor the
+    denominator to ``total_incidents``:
+
+        max_allowable_waste = max(total_incidents × MAX_WASTE_PER_INCIDENT, 1.0)
+        resource_usage      = max(0.0, 1.0 - (wasted_dispatches / max_allowable_waste))
+
+    ``MAX_WASTE_PER_INCIDENT`` (default 5.0) represents the expected worst-case
+    accumulated penalty per incident across a typical episode.  This makes the
+    score scale proportionally with problem difficulty, giving fair comparisons
+    across task difficulties.
 
     Args:
-        wasted_dispatches: Number of over-allocation events across the episode,
-                           or ``None`` if not tracked by the caller.
-        total_steps:       Total steps in the episode.
-        num_zones:         Number of distinct zones in the environment.
+        wasted_dispatches: Severity-weighted accumulated waste float tracked by
+                           the environment, or ``None`` if not available (legacy).
+        total_steps:       Total steps in the episode (kept for API compatibility;
+                           not used in the primary formula).
+        num_zones:         Number of distinct zones (kept for API compatibility;
+                           not used in the primary formula).
+        total_incidents:   Number of incidents active at episode start.  Used
+                           as the normalisation anchor for max_allowable_waste.
+                           Defaults to 0, which triggers the legacy 0.5 fallback.
 
     Returns:
         Float in ``[0.0, 1.0]``.
@@ -249,14 +316,24 @@ def _compute_resource_usage(
         logger.debug("wasted_dispatches not provided; resource_usage defaults to 0.5")
         return 0.5
 
-    max_waste = float(max(total_steps * num_zones, 1))  # Prevent division by zero.
-    waste_ratio = _clamp(float(wasted_dispatches) / max_waste)
-    result = 1.0 - waste_ratio
+    if total_incidents <= 0:
+        # No incidents in the episode: any dispatch is technically wasted, but
+        # there is nothing meaningful to penalise. Return a neutral prior.
+        logger.debug("total_incidents=0; resource_usage defaults to 1.0 (no-op episode)")
+        return 1.0
+
+    # Dynamically compute the ceiling based on the episode's incident count so
+    # the score scales proportionally with problem difficulty.
+    max_allowable_waste = float(total_incidents) * GraderConfig.MAX_WASTE_PER_INCIDENT
+    max_allowable_waste = max(max_allowable_waste, 1.0)  # guard against zero-incident edge case
+
+    # Linear penalty: subtract waste ratio from perfect score, floor at 0.
+    resource_usage = max(0.0, 1.0 - (float(wasted_dispatches) / max_allowable_waste))
     logger.debug(
-        "resource_usage: wasted=%d, max_waste=%.0f, ratio=%.4f → score=%.4f",
-        wasted_dispatches, max_waste, waste_ratio, result,
+        "resource_usage: wasted=%.2f, total_incidents=%d, max_waste=%.2f → score=%.4f",
+        wasted_dispatches, total_incidents, max_allowable_waste, resource_usage,
     )
-    return result
+    return resource_usage
 
 
 # ---------------------------------------------------------------------------
@@ -269,7 +346,7 @@ def grade_episode(
     total_reward: float,
     total_steps: int,
     num_zones: int,
-    wasted_dispatches: Optional[int] = None,
+    wasted_dispatches: Optional[float] = None,
 ) -> float:
     """Deterministically grade a complete episode and return a score in [0.0, 1.0].
 
@@ -285,18 +362,23 @@ def grade_episode(
         - No randomness.
         - Same inputs → same output, always.
 
+    The ``resource_usage`` sub-component uses the **Severity-Weighted Resource
+    Penalty** model (see ``_compute_resource_usage`` for the full derivation).
+    ``wasted_dispatches`` is a *float* accumulating context-aware penalty units
+    (not a raw event count), so over-dispatching to calm zones is penalised more
+    severely than a safety buffer on a catastrophic incident.
+
     Args:
         incidents_resolved: Number of distinct incidents cleared this episode.
         total_incidents:    Number of distinct incidents present at episode
                             start (denominator for success_rate).
         total_reward:       Cumulative step-reward sum for the episode.
-        total_steps:        Total number of steps taken (used for efficiency
-                            and resource_usage normalisation).
-        num_zones:          Number of zones in the environment (used to derive
-                            the max possible waste ceiling).
-        wasted_dispatches:  Optional count of over-allocation events tracked
-                            by the environment.  If ``None``, resource_usage
-                            defaults to 0.5.
+        total_steps:        Total number of steps taken (kept for API compatibility;
+                            not used as the waste normalisation denominator).
+        num_zones:          Number of zones in the environment (kept for API
+                            compatibility).
+        wasted_dispatches:  Severity-weighted accumulated waste float from the
+                            environment.  If ``None``, resource_usage defaults to 0.5.
 
     Returns:
         A float in ``[0.0, 1.0]`` representing the episode quality.
@@ -308,7 +390,7 @@ def grade_episode(
         ...     total_reward=18.5,
         ...     total_steps=10,
         ...     num_zones=3,
-        ...     wasted_dispatches=2,
+        ...     wasted_dispatches=2.5,
         ... )
         0.7...  # exact value depends on config
     """
@@ -318,8 +400,10 @@ def grade_episode(
     # ---- Sub-component 2: efficiency ------------------------------------- #
     efficiency = _compute_efficiency(total_reward, total_incidents)
 
-    # ---- Sub-component 3: resource_usage --------------------------------- #
-    resource_usage = _compute_resource_usage(wasted_dispatches, total_steps, num_zones)
+    # ---- Sub-component 3: resource_usage (Severity-Weighted Waste) ------- #
+    resource_usage = _compute_resource_usage(
+        wasted_dispatches, total_steps, num_zones, total_incidents
+    )
 
     # ---- Weighted sum (exact specification formula) ----------------------- #
     cfg = GraderConfig
@@ -354,15 +438,17 @@ class GraderException(Exception):
 class Grader:
     """Thin class wrapper around the ``grade_episode`` pure function.
 
-    ``environment.py`` calls ``Grader().get_score(resolved, total, reward)``
+    ``environment.py`` calls ``Grader().get_score(resolved, total, reward, ...)
     at every step.  This class retains that API while delegating all real
     computation to the deterministic ``grade_episode`` function.
 
-    Note:
-        ``get_score`` is called mid-episode with partial metrics. The
-        ``resource_usage`` sub-component therefore defaults to 0.5 (neutral
-        prior) because the environment does not pass wasted-dispatch counts
-        through this legacy interface.
+    The ``resource_usage`` sub-component uses the **Severity-Weighted Resource
+    Penalty** model.  ``wasted_dispatches`` is a *float* accumulated by the
+    environment: each excess unit dispatched above the minimum requirement
+    contributes a severity-scaled penalty (×2.0 for calm zones, ×0.5 for
+    critical-incident buffers).  The grader normalises this float against
+    ``total_incidents × MAX_WASTE_PER_INCIDENT`` so scores are comparable
+    across episodes of different lengths and zone counts.
     """
 
     def get_score(
@@ -372,7 +458,7 @@ class Grader:
         total_reward: float,
         total_steps: int = 1,
         num_zones: int = 3,
-        wasted_dispatches: Optional[int] = None,
+        wasted_dispatches: Optional[float] = None,
     ) -> Tuple[float, float]:
         """Compute a partial episode score and return ``(score, efficiency)``.
 
@@ -385,7 +471,9 @@ class Grader:
             total_reward:       Cumulative reward so far.
             total_steps:        Steps elapsed (defaults to 1 for partial runs).
             num_zones:          Number of zones (defaults to 3).
-            wasted_dispatches:  Optional over-allocation event count.
+            wasted_dispatches:  Severity-weighted accumulated waste float from
+                                the environment.  If ``None``, resource_usage
+                                defaults to the neutral prior of 0.5.
 
         Returns:
             ``(final_score, efficiency)`` — both floats in ``[0.0, 1.0]``.

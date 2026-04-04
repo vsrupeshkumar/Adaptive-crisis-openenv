@@ -239,7 +239,7 @@ class CrisisManagementEnv:
         self._resolved_incidents = 0
         self._lives_saved = 0
         self._total_incidents = self._count_incidents(self.obs)
-        self._wasted_dispatches: int = 0  # Blocker #2: tracks over-allocation events for grader.
+        self._wasted_dispatches: float = 0.0  # Blocker #2: severity-weighted waste accumulator for grader.
         self._prev_obs: Optional[Observation] = None  # Blocker #3: temporal shaping anchor
 
         logger.debug("Environment reset.  Total incidents: %d.", self._total_incidents)
@@ -271,8 +271,14 @@ class CrisisManagementEnv:
             )
 
         # 1. Advance time and recover returned units.
-        # Blocker #3: snapshot previous obs BEFORE the tick so temporal
-        # shaping in calculate_step_reward receives a genuinely distinct prior.
+        # Blocker #3: capture a deep-copy of the *current* obs BEFORE the tick
+        # so we have a clean immutable snapshot of "what the world looked like
+        # in the previous step" to pass into the reward function.
+        # This local variable serves two purposes:
+        #   a) Step-1 fallback for calculate_step_reward (self._prev_obs is None
+        #      at episode start, so we use this as the bootstrap prior).
+        #   b) The severity snapshot for the waste accumulator (must read
+        #      pre-resolution fire/patient levels).
         prev_obs_snapshot: Observation = self.obs.model_copy(deep=True)
 
         self.obs.step += 1
@@ -281,32 +287,93 @@ class CrisisManagementEnv:
         )
 
         # 2. Compute reward *before* resolving zones (uses pre-action state).
-        # Blocker #3: pass distinct previous_state to unlock temporal shaping.
+        # Blocker #3 — Trajectory-Aware Reward Shaping:
+        #   * On step 1 self._prev_obs is None (fresh episode); we fall back to
+        #     the pre-tick snapshot so the reward function always receives a
+        #     valid Observation rather than None.
+        #   * On step 2+, self._prev_obs holds the genuine previous episode step's
+        #     observation, enabling the Stabilization Bonus and Degradation Penalty
+        #     calculations inside calculate_step_reward to see a real Δ.
+        temporal_prior: Observation = self._prev_obs if self._prev_obs is not None else prev_obs_snapshot
         reward = calculate_step_reward(
             current_state=self.obs,
             action=action,
-            previous_state=prev_obs_snapshot,
+            previous_state=temporal_prior,
         )
         self._total_reward += reward
 
         # 3. Commit allocations and resolve each zone.
-        # Track over-allocations for Blocker #2 grader accuracy.
+        # Track over-allocations for Blocker #2 grader accuracy (severity-weighted).
+        from env.reward import _get_required_fire, _get_required_ambulance
         for zone_id, zone_state in self.obs.zones.items():
             dispatch = action.allocations.get(zone_id, ZoneDispatch())
+            # Snapshot zone severity BEFORE resolution so the penalty reflects
+            # the hazard level that the agent actually faced this step.
+            pre_fire_level  = zone_state.fire
+            pre_patient_level = zone_state.patient
+
             used_fire, used_amb, used_pol = self._commit_allocation(
                 zone_id, zone_state, dispatch
             )
             self._resolve_zone(zone_id, zone_state, used_fire, used_amb, used_pol)
 
-            # Blocker #2: count over-allocation events (D > R for any resource).
-            from env.reward import _get_required_fire, _get_required_ambulance
-            req_f = _get_required_fire(zone_state.fire, self.obs.weather)
-            req_a = _get_required_ambulance(zone_state.patient)
-            if dispatch.dispatch_fire > req_f or dispatch.dispatch_ambulance > req_a:
-                self._wasted_dispatches += 1
+            # ------------------------------------------------------------------
+            # Severity-Weighted Resource Penalty (Blocker #2 — novel grader)
+            # ------------------------------------------------------------------
+            # Philosophy: over-dispatching to an already-calm zone is the most
+            # wasteful act (resources are precious and finite).  Over-dispatching
+            # to a CATASTROPHIC / CRITICAL zone is more forgivable — a safety
+            # buffer is a rational hedge against uncertainty.  We therefore
+            # apply a *lower* penalty multiplier as severity increases.
+            #
+            # Fire severity penalty weights:
+            #   NONE / LOW          → 2.0  (worst waste: zone didn't need them)
+            #   MEDIUM              → 1.0  (moderate waste)
+            #   HIGH / CATASTROPHIC → 0.5  (forgivable over-insurance)
+            #
+            # Ambulance severity penalty weights mirror the same philosophy for
+            # patient triage levels.
+            #
+            # Each *excess unit* above the computed requirement contributes its
+            # severity-weighted amount to _wasted_dispatches, giving the grader
+            # a continuous, context-aware signal instead of a binary count.
+            req_f = _get_required_fire(pre_fire_level, self.obs.weather)
+            req_a = _get_required_ambulance(pre_patient_level)
 
-        # Advance temporal shaping anchor.
-        self._prev_obs = prev_obs_snapshot
+            fire_excess = max(0, dispatch.dispatch_fire - req_f)
+            amb_excess  = max(0, dispatch.dispatch_ambulance - req_a)
+
+            if fire_excess > 0:
+                fire_penalty_weight: float
+                if pre_fire_level in (FireLevel.HIGH, FireLevel.CATASTROPHIC):
+                    fire_penalty_weight = 0.5   # forgivable — high-stakes buffer
+                elif pre_fire_level == FireLevel.MEDIUM:
+                    fire_penalty_weight = 1.0   # moderate waste
+                else:  # LOW or NONE
+                    fire_penalty_weight = 2.0   # egregious — zone was calm
+                self._wasted_dispatches += fire_excess * fire_penalty_weight
+                logger.debug(
+                    "%s: fire over-dispatch +%d (severity=%s, weight=%.1f) "
+                    "→ waste_delta=%.1f",
+                    zone_id, fire_excess, pre_fire_level.value,
+                    fire_penalty_weight, fire_excess * fire_penalty_weight,
+                )
+
+            if amb_excess > 0:
+                amb_penalty_weight: float
+                if pre_patient_level == PatientLevel.CRITICAL:
+                    amb_penalty_weight = 0.5    # forgivable — critical triage buffer
+                elif pre_patient_level == PatientLevel.MODERATE:
+                    amb_penalty_weight = 1.0    # moderate waste
+                else:  # NONE or FATAL
+                    amb_penalty_weight = 2.0    # egregious — no live patients
+                self._wasted_dispatches += amb_excess * amb_penalty_weight
+                logger.debug(
+                    "%s: ambulance over-dispatch +%d (severity=%s, weight=%.1f) "
+                    "→ waste_delta=%.1f",
+                    zone_id, amb_excess, pre_patient_level.value,
+                    amb_penalty_weight, amb_excess * amb_penalty_weight,
+                )
 
         # 4. Determine episode termination.
         all_clear = all(
@@ -337,6 +404,13 @@ class CrisisManagementEnv:
             "efficiency": eff_score,
             "wasted_dispatches": self._wasted_dispatches,
         }
+
+        # Blocker #3: advance the temporal shaping anchor AFTER all mutations.
+        # We store ``prev_obs_snapshot`` (captured pre-tick, pre-resolution) so
+        # that on the NEXT step, calculate_step_reward sees the genuine "state
+        # the world was in before this step" — not the post-resolution mutated obs.
+        # This strict ordering enables accurate Δ-severity calculations.
+        self._prev_obs = prev_obs_snapshot
 
         return self.obs.model_copy(deep=True), float(reward), self._is_done, info
 
