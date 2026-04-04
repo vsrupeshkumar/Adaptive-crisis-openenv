@@ -34,6 +34,7 @@ import argparse
 import json
 import logging
 import os
+import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -599,7 +600,7 @@ def run_episode(agent: LLMAgent, task_id: int) -> None:
             success     = final_score >= 0.5
             break
 
-    # ---- Episode summary ---------------------------------------------------
+    # ---- Episode summary (OpenEnv structured log line) --------------------
     summary = metrics.get_summary()
     log_end(
         success=success,
@@ -614,6 +615,30 @@ def run_episode(agent: LLMAgent, task_id: int) -> None:
         "=== Task %d complete | success=%s | score=%.3f | steps=%d ===",
         task_id, success, final_score, step_count,
     )
+
+    # -------------------------------------------------------------------------
+    # Bulletproof I/O teardown — OpenEnv evaluator compliance
+    # -------------------------------------------------------------------------
+    # All lines below write EXCLUSIVELY to sys.stdout (never logging/stderr) so
+    # that the Docker-level stdout capture and the bot's regex/JSON parsers see
+    # a clean, ordered stream.
+    #
+    # Rules enforced:
+    #   1. flush=True on every print → defeats Docker block-buffering.
+    #   2. file=sys.stdout explicitly → eliminates any chance of logging
+    #      formatters interleaving with the evaluator-facing output.
+    #   3. total_reward formatted to exactly 4 decimal places → prevents
+    #      scientific notation (e.g. 1.23e+02) that breaks float parsers.
+    #   4. obs.model_dump_json() printed on its own line with NO prefix text
+    #      → bot can call json.loads() on that single line without slicing.
+    # -------------------------------------------------------------------------
+    total_reward: float = sum(rewards)
+    formatted_reward: str = "{:.4f}".format(total_reward)
+
+    print("=== EVALUATION COMPLETE ===", file=sys.stdout, flush=True)
+    print(f"Total Reward: {formatted_reward}", file=sys.stdout, flush=True)
+    print("Final State:", file=sys.stdout, flush=True)
+    print(obs.model_dump_json(indent=2), file=sys.stdout, flush=True)
 
 
 # ===========================================================================
