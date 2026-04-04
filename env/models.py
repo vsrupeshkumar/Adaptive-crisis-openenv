@@ -44,7 +44,7 @@ import logging
 from enum import Enum
 from typing import Annotated, Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, StrictBool, StrictInt, field_validator, model_validator
 
 _log = logging.getLogger("crisis_env.models")
 
@@ -252,12 +252,19 @@ class Observation(BaseModel):
 
     Attributes:
         weather:         Global weather condition (affects all zones equally).
-        zones:           Zone-id → ZoneState mapping.
+        zones:           Zone-id \u2192 ZoneState mapping.
         idle_resources:  Units available for dispatch this step.
         busy_resources:  Units currently deployed (on cooldown).
         step:            Current step index (0 at episode start).
         max_steps:       Truncation limit for this episode.
-        task_level:      Difficulty tier this episode runs (``"easy"`` …).
+        task_level:      Difficulty tier this episode runs (``"easy"`` \u2026).
+        previous_action_feedback: Plain-English delta summary injected by the
+                         environment after every ``step()``.  Tells the agent
+                         what changed in each zone relative to its last action
+                         (fire went up/down/held, was the dispatch sufficient).
+                         ``None`` on the first step (no prior action exists).
+                         The agent should use this as its primary learning
+                         signal to calibrate future dispatch quantities.
     """
 
     weather: WeatherCondition
@@ -267,6 +274,13 @@ class Observation(BaseModel):
     step: int = Field(default=0, ge=0)
     max_steps: int = Field(default=10, ge=1)
     task_level: TaskLevel = TaskLevel.EASY
+    previous_action_feedback: Optional[str] = Field(
+        default=None,
+        description=(
+            "Structured natural-language delta from the last step. "
+            "Null on step 0.  Use this to calibrate your next dispatch."
+        ),
+    )
 
     @model_validator(mode="after")
     def _validate_resource_pools(self) -> "Observation":
@@ -302,139 +316,92 @@ class Observation(BaseModel):
 class ZoneDispatch(BaseModel):
     """Dispatch instruction for a single zone within one simulation step.
 
-    This model is the primary attack-surface for erratic LLM outputs.  Every
-    numeric field uses a permissive ``mode="before"`` validator that converts
-    strings, floats, and ``None`` into safe integer values rather than crashing.
+    **Strict Bouncer Mode** — Agentic Purity Enforcement
+    -------------------------------------------------------
+    This model enforces exact RL action-space boundaries (A_t ∈ A).  It does
+    NOT coerce, clean, or repair malformed LLM outputs.  Any output that is
+    not a perfect non-negative integer is immediately rejected with a
+    ``ValidationError``.  The environment catches that error and applies the
+    INVENTORY_BREACH terminal penalty.  There are NO silent janitors here.
+
+    Valid input contract:
+        dispatch_fire      : strict int  ≥ 0
+        dispatch_ambulance : strict int  ≥ 0
+        control_traffic    : strict bool
+
+    Rejected inputs that previously passed (now fatal):
+        "3"   (string int)  → ValidationError
+        3.7   (float)       → ValidationError
+        -1    (negative)    → ValidationError
+        None  (missing)     → ValidationError
+        "yes" (string bool) → ValidationError
 
     Attributes:
-        dispatch_fire:      Fire units to send (non-negative, capped).
-        dispatch_ambulance: Ambulance units to send (non-negative, capped).
-        control_traffic:    Whether to deploy a police unit.
-
-    Examples:
-        >>> ZoneDispatch(dispatch_fire="five")          # → 0 (unparsable → 0)
-        >>> ZoneDispatch(dispatch_fire="3.7")           # → 3 (floor truncation)
-        >>> ZoneDispatch(dispatch_fire="-3")            # → 0 (negative → clamp)
-        >>> ZoneDispatch(dispatch_fire=None)            # → 0 (None → 0)
-        >>> ZoneDispatch(control_traffic="yes")         # → True
-        >>> ZoneDispatch(control_traffic="false")       # → False
-        >>> ZoneDispatch(control_traffic=0)             # → False
+        dispatch_fire:      Fire units to dispatch (strict non-negative int).
+        dispatch_ambulance: Ambulance units to dispatch (strict non-negative int).
+        control_traffic:    Whether to deploy a police unit (strict bool).
     """
 
-    dispatch_fire: int = Field(
+    dispatch_fire: StrictInt = Field(
         default=0,
-        ge=0,
-        le=_MAX_DISPATCH_PER_ZONE,
-        description="Fire units to dispatch (0–50).  Clamped to idle pool at simulation time.",
+        description="Fire units to dispatch. Must be a non-negative integer. Strings, floats, and None are rejected.",
     )
-    dispatch_ambulance: int = Field(
+    dispatch_ambulance: StrictInt = Field(
         default=0,
-        ge=0,
-        le=_MAX_DISPATCH_PER_ZONE,
-        description="Ambulance units to dispatch (0–50).  Clamped to idle pool at simulation time.",
+        description="Ambulance units to dispatch. Must be a non-negative integer. Strings, floats, and None are rejected.",
     )
-    control_traffic: bool = Field(
+    control_traffic: StrictBool = Field(
         default=False,
-        description="Deploy one police unit for traffic control.",
+        description="Deploy one police unit for traffic control. Must be a strict Python bool (True/False). Strings and ints are rejected.",
     )
 
     # ------------------------------------------------------------------
-    # Numeric field validators (LLM hallucination safety net)
+    # Strict boundary validators — Agentic Purity Check
+    # RULE: These validators ONLY raise ValueError. They NEVER fix values.
     # ------------------------------------------------------------------
 
-    @field_validator("dispatch_fire", "dispatch_ambulance", mode="before")
+    @field_validator("dispatch_fire", mode="after")
     @classmethod
-    def _coerce_dispatch_count(cls, raw: Any) -> int:
-        """Convert an LLM-generated value to a safe non-negative integer.
-
-        Behaviour by input type:
-
-        +-----------------------+---------------------------+
-        | Input                 | Output                    |
-        +=======================+===========================+
-        | ``5`` (int)           | ``5``                     |
-        +-----------------------+---------------------------+
-        | ``3.7`` (float)       | ``3`` (floor-truncated)   |
-        +-----------------------+---------------------------+
-        | ``"3"`` (str int)     | ``3``                     |
-        +-----------------------+---------------------------+
-        | ``"3.7"`` (str float) | ``3`` (floor-truncated)   |
-        +-----------------------+---------------------------+
-        | ``"-3"`` (negative)   | ``0`` (clamped)           |
-        +-----------------------+---------------------------+
-        | ``"five"`` (word)     | ``0`` (unparsable)        |
-        +-----------------------+---------------------------+
-        | ``None``              | ``0`` (missing → zero)    |
-        +-----------------------+---------------------------+
-        | ``True`` / ``False``  | ``ValueError`` (rejected) |
-        +-----------------------+---------------------------+
+    def _ensure_fire_non_negative(cls, v: int) -> int:
+        """Reject negative fire dispatch counts — no clamping.
 
         Args:
-            raw: The raw value supplied by the agent or deserialiser.
+            v: The integer value after strict type enforcement.
 
         Returns:
-            A non-negative integer safe to use for dispatch.
+            ``v`` unchanged if it is non-negative.
 
         Raises:
-            ValueError: Only when ``raw`` is a boolean (ambiguous intent).
+            ValueError: Immediately if ``v < 0``.  The LLM must correct its
+                own output.  The environment will not do it for the agent.
         """
-        if isinstance(raw, bool):
+        if v < 0:
             raise ValueError(
-                f"dispatch count must be an integer, not a boolean ({raw!r}). "
-                "Use 0 or 1 instead."
+                f"Action Space Violation (dispatch_fire): Expected >= 0, got {v}. "
+                "Negative dispatch counts are outside the valid action space A_t ∈ A."
             )
-        if raw is None:
-            _log.debug("dispatch count was None; defaulting to 0.")
-            return 0
-        try:
-            coerced = int(float(str(raw)))
-        except (ValueError, TypeError):
-            _log.warning(
-                "Unparsable dispatch value %r from agent; defaulting to 0.", raw
-            )
-            return 0
-        if coerced < 0:
-            _log.debug("Negative dispatch %d clamped to 0.", coerced)
-            return 0
-        return min(coerced, _MAX_DISPATCH_PER_ZONE)
+        return v
 
-    # ------------------------------------------------------------------
-    # Boolean field validator (LLM often returns "yes"/"no"/"1"/"0")
-    # ------------------------------------------------------------------
-
-    @field_validator("control_traffic", mode="before")
+    @field_validator("dispatch_ambulance", mode="after")
     @classmethod
-    def _coerce_bool(cls, raw: Any) -> bool:
-        """Convert permissive truthy values to a strict Python ``bool``.
-
-        Handles LLM outputs such as ``"yes"``, ``"true"``, ``"1"``,
-        ``"no"``, ``"false"``, ``"0"``, ``None``, or integers.
+    def _ensure_ambulance_non_negative(cls, v: int) -> int:
+        """Reject negative ambulance dispatch counts — no clamping.
 
         Args:
-            raw: Raw value from the agent or deserialiser.
+            v: The integer value after strict type enforcement.
 
         Returns:
-            ``True`` or ``False``.
+            ``v`` unchanged if it is non-negative.
+
+        Raises:
+            ValueError: Immediately if ``v < 0``.
         """
-        if isinstance(raw, bool):
-            return raw
-        if isinstance(raw, int):
-            return raw != 0
-        if isinstance(raw, str):
-            normalised = raw.strip().lower()
-            if normalised in {"true", "yes", "1", "on"}:
-                return True
-            if normalised in {"false", "no", "0", "off", "none", "null"}:
-                return False
-            _log.warning(
-                "Unrecognised bool string %r for control_traffic; defaulting to False.",
-                raw,
+        if v < 0:
+            raise ValueError(
+                f"Action Space Violation (dispatch_ambulance): Expected >= 0, got {v}. "
+                "Negative dispatch counts are outside the valid action space A_t ∈ A."
             )
-            return False
-        if raw is None:
-            return False
-        # Fall-through: trust Python truthiness.
-        return bool(raw)
+        return v
 
 
 class Action(BaseModel):
@@ -486,22 +453,14 @@ class Action(BaseModel):
         Args:
             raw: Raw allocations payload.
 
-        Returns:
-            A dict (possibly empty).
-
-        Raises:
-            ValueError: If ``raw`` is not dict-like and cannot be defaulted.
         """
-        if raw is None:
-            _log.warning("Action.allocations was None; defaulting to empty dict.")
-            return {}
-        if isinstance(raw, dict):
-            return raw
-        _log.warning(
-            "Action.allocations expected dict, got %s; defaulting to empty dict.",
-            type(raw).__name__,
-        )
-        return {}
+        if not isinstance(raw, dict):
+            raise ValueError(
+                f"Action Space Violation (allocations): Expected a JSON object (dict), "
+                f"got {type(raw).__name__!r}. The LLM must output a valid allocations mapping. "
+                "Null, list, and string payloads are outside the valid action space."
+            )
+        return raw
 
 
 # ===========================================================================

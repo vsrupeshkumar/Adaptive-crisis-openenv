@@ -69,6 +69,15 @@ class EnvironmentException(Exception):
     """
 
 
+class InventoryBreachException(Exception):
+    """Raised internally when the LLM requests more units than available.
+
+    This exception is caught within ``step()`` and converted to a catastrophic
+    terminal penalty rather than propagating to the caller.  It serves as the
+    internal signal that an Inventory Breach has occurred.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
@@ -296,6 +305,124 @@ class CrisisManagementEnv:
             self.obs, self._active_deployments
         )
 
+        # =====================================================================
+        # Agentic Purity Check: Strict MDP enforcement. Impossible actions are
+        # rejected and penalized to enforce LLM inventory tracking.
+        #
+        # Pre-flight INVENTORY BREACH gate:
+        #   Sum the LLM's requested units across ALL zones for each resource
+        #   category.  If ANY category exceeds the available idle pool, the
+        #   action is physically impossible and constitutes a hallucination
+        #   failure.  We do NOT silently clamp — we apply a catastrophic
+        #   terminal penalty, void the entire action, and terminate the episode.
+        #
+        #   Penalty formula:
+        #     R_terminal = -15.0 × severity_multiplier
+        #   where severity_multiplier is amplified (×2.0) when a HIGH /
+        #   CATASTROPHIC fire or CRITICAL patient is active, because failing
+        #   to deploy during a life-threatening crisis is maximally egregious.
+        # =====================================================================
+        total_req_fire = sum(
+            action.allocations.get(z, ZoneDispatch()).dispatch_fire
+            for z in self.obs.zones
+        )
+        total_req_amb = sum(
+            action.allocations.get(z, ZoneDispatch()).dispatch_ambulance
+            for z in self.obs.zones
+        )
+        total_req_pol = sum(
+            1 for z in self.obs.zones
+            if action.allocations.get(z, ZoneDispatch()).control_traffic
+        )
+
+        idle = self.obs.idle_resources
+        breach_fire  = total_req_fire > idle.fire_units
+        breach_amb   = total_req_amb  > idle.ambulances
+        breach_pol   = total_req_pol  > idle.police
+
+        if breach_fire or breach_amb or breach_pol:
+            # Identify which categories were breached for the feedback message.
+            breach_details: List[str] = []
+            if breach_fire:
+                breach_details.append(
+                    f"fire_units: requested {total_req_fire}, available {idle.fire_units}"
+                )
+            if breach_amb:
+                breach_details.append(
+                    f"ambulances: requested {total_req_amb}, available {idle.ambulances}"
+                )
+            if breach_pol:
+                breach_details.append(
+                    f"police: requested {total_req_pol}, available {idle.police}"
+                )
+
+            breach_msg = "CRITICAL FAILURE: " + "; ".join(breach_details) + ". Action voided."
+            logger.error(
+                "[Step %d] INVENTORY BREACH — %s",
+                self.obs.step, breach_msg,
+            )
+
+            # Severity multiplier: ×2.0 if a life-threatening incident is active.
+            has_critical = any(
+                z.fire in (FireLevel.HIGH, FireLevel.CATASTROPHIC)
+                or z.patient == PatientLevel.CRITICAL
+                for z in self.obs.zones.values()
+            )
+            severity_multiplier = 2.0 if has_critical else 1.0
+            breach_penalty: float = -15.0 * severity_multiplier
+
+            self._total_reward += breach_penalty
+            self._is_done = True  # Episode terminates immediately — no second chances.
+
+            logger.error(
+                "[Step %d] INVENTORY BREACH terminal penalty: %.1f (severity_mult=%.1f). "
+                "Episode terminated.",
+                self.obs.step, breach_penalty, severity_multiplier,
+            )
+
+            # Build a minimal Reward ledger for the breach step.
+            breach_ledger = Reward(
+                base_dispatch_score=breach_penalty,
+                nlp_semantic_bonus=0.0,
+                waste_penalty=0.0,
+                total_reward=breach_penalty,
+                dispatch_quality=breach_penalty,
+                trajectory_shaping=0.0,
+                nlp_bonus=0.0,
+                is_terminal=True,
+            )
+            logger.info(
+                "[Step %d] Reward Ledger (BREACH): %s",
+                self.obs.step,
+                breach_ledger.model_dump_json(),
+            )
+
+            from env.grader import Grader
+            score, eff_score = Grader().get_score(
+                incidents_resolved=self._resolved_incidents,
+                total_incidents=self._total_incidents,
+                total_reward=self._total_reward,
+                total_steps=max(self.obs.step, 1),
+                num_zones=len(self.obs.zones),
+                wasted_dispatches=self._wasted_dispatches,
+            )
+            self._prev_obs = prev_obs_snapshot
+            return (
+                self.obs.model_copy(deep=True),
+                breach_penalty,
+                True,
+                {
+                    "resolved": self._resolved_incidents,
+                    "total": self._total_incidents,
+                    "score": score,
+                    "efficiency": eff_score,
+                    "wasted_dispatches": self._wasted_dispatches,
+                    "reward_ledger": breach_ledger.model_dump(),
+                    "inventory_breach": True,
+                    "error_feedback": breach_msg,
+                },
+            )
+
         # 2. Compute reward *before* resolving zones (uses pre-action state).
         # Blocker #3 — Trajectory-Aware Reward Shaping:
         #   * On step 1 self._prev_obs is None (fresh episode); we fall back to
@@ -396,6 +523,82 @@ class CrisisManagementEnv:
         if all_clear or self.obs.step >= self.obs.max_steps:
             self._is_done = True
             logger.info("Evaluation Terminated natively. Executing Scorecard hook.")
+
+        # 4b. Generate Delta Feedback for the LLM's next observation.
+        # This is the In-Context RL breadcrumb trail: per-zone plain-English
+        # summaries of what changed and whether the dispatch was sufficient.
+        # No numeric thresholds are disclosed — the agent must calibrate from
+        # the direction of change (improved / held / degraded).
+        feedback_lines: list[str] = [
+            f"[Step {self.obs.step - 1} Dispatch Results]"
+        ]
+        for zone_id in self.obs.zones:
+            prev_z = prev_obs_snapshot.zones.get(zone_id)
+            cur_z  = self.obs.zones[zone_id]
+            disp   = action.allocations.get(zone_id, ZoneDispatch())
+
+            if prev_z is None:
+                continue
+
+            parts: list[str] = [f"{zone_id}:"]
+
+            # --- Fire delta ---
+            if prev_z.fire != FireLevel.NONE:
+                if cur_z.fire == FireLevel.NONE:
+                    parts.append(
+                        f"fire RESOLVED (sent {disp.dispatch_fire} fire units — SUFFICIENT)."
+                    )
+                elif cur_z.fire.value > prev_z.fire.value:
+                    parts.append(
+                        f"fire ESCALATED {prev_z.fire.value}→{cur_z.fire.value} "
+                        f"(sent {disp.dispatch_fire} fire units — INSUFFICIENT, increase allocation)."
+                    )
+                else:
+                    parts.append(
+                        f"fire HELD at {cur_z.fire.value} "
+                        f"(sent {disp.dispatch_fire} fire units — STABILIZED but not resolved)."
+                    )
+
+            # --- Patient delta ---
+            if prev_z.patient not in (PatientLevel.NONE, PatientLevel.FATAL):
+                if cur_z.patient == PatientLevel.NONE:
+                    parts.append(
+                        f"medical RESOLVED (sent {disp.dispatch_ambulance} ambulances — SUFFICIENT)."
+                    )
+                elif cur_z.patient == PatientLevel.FATAL:
+                    parts.append(
+                        f"patient status FATAL — too late to act."
+                    )
+                elif cur_z.patient.value > prev_z.patient.value:
+                    parts.append(
+                        f"patient condition WORSENED {prev_z.patient.value}→{cur_z.patient.value} "
+                        f"(sent {disp.dispatch_ambulance} ambulances — INSUFFICIENT)."
+                    )
+                else:
+                    parts.append(
+                        f"patient STABLE at {cur_z.patient.value} "
+                        f"(sent {disp.dispatch_ambulance} ambulances — holding, not resolved)."
+                    )
+
+            # --- Traffic delta ---
+            if prev_z.traffic in (TrafficLevel.HEAVY, TrafficLevel.GRIDLOCK):
+                police_sent = "police deployed" if disp.control_traffic else "no police sent"
+                if cur_z.traffic == TrafficLevel.LOW:
+                    parts.append(f"traffic CLEARED ({police_sent} — SUFFICIENT).")
+                else:
+                    parts.append(
+                        f"traffic PERSISTS at {cur_z.traffic.value} "
+                        f"({police_sent} — deploy police to clear congestion)."
+                    )
+
+            if len(parts) == 1:
+                parts.append("zone was clear, no active incidents.")
+
+            feedback_lines.append(" ".join(parts))
+
+        self.obs.previous_action_feedback = "\n".join(feedback_lines)
+        logger.debug("Delta feedback generated: %s", self.obs.previous_action_feedback)
+
 
         # 5. Build info dict — Blocker #2: all three grader components now live.
         from env.grader import Grader  # local import avoids circular deps at module level
@@ -540,19 +743,21 @@ class CrisisManagementEnv:
             A 3-tuple ``(used_fire, used_amb, used_pol)`` reflecting the
             actual units dispatched after clamping.
         """
-        used_fire = min(dispatch.dispatch_fire, self.obs.idle_resources.fire_units)
-        used_amb = min(dispatch.dispatch_ambulance, self.obs.idle_resources.ambulances)
-        used_pol = (
-            1 if dispatch.control_traffic and self.obs.idle_resources.police > 0 else 0
-        )
+        # Agentic Purity Check: No clamping. The INVENTORY_BREACH gate in
+        # step() has already mathematically verified that aggregate requests
+        # do not exceed the idle pool.  We therefore trust the LLM's exact
+        # dispatch values and apply them verbatim — no min() safety nets.
+        used_fire = dispatch.dispatch_fire
+        used_amb  = dispatch.dispatch_ambulance
+        used_pol  = 1 if dispatch.control_traffic else 0
 
-        # Move units from idle → busy pool.
+        # Move units from idle → busy pool (exact, no clamping).
         self.obs.idle_resources.fire_units -= used_fire
         self.obs.idle_resources.ambulances -= used_amb
-        self.obs.idle_resources.police -= used_pol
+        self.obs.idle_resources.police     -= used_pol
         self.obs.busy_resources.fire_units += used_fire
         self.obs.busy_resources.ambulances += used_amb
-        self.obs.busy_resources.police += used_pol
+        self.obs.busy_resources.police     += used_pol
 
         # Calculate cooldown duration (weather + gridlock prolong deployments).
         cooldown = 1
