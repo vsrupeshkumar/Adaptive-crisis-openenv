@@ -208,7 +208,9 @@ The exact resource thresholds are NOT given to you. Deduce them from feedback:
 - Zone RESOLVED → your dispatch was SUFFICIENT. Remember the quantity used.
 - Zone ESCALATED → your dispatch was INSUFFICIENT. Increase next allocation.
 - Zone HELD STABLE → you matched minimum but did not exceed it. Adjust accordingly.
-- Traffic PERSISTS → deploy police to clear congestion.
+
+## EPISTEMIC LENS: TEMPORAL DEDUCTION
+You do not have access to a failure counter. To determine if your previous dispatches were successful, you must cross-reference your past actions with the current severity levels in the observation. If a hazard's severity does not decrease, your allocation was insufficient and the zone is approaching a critical cascade.
 
 ## HARD PHYSICAL CONSTRAINT — INVENTORY BREACH
 You CANNOT request more total resources than your current idle pool in any category

@@ -227,17 +227,19 @@ class ActiveDeployment(BaseModel):
 class ZoneState(BaseModel):
     """Current hazard state of a single city zone.
 
+    POMDP Boundary Enforced: This model acts as an Epistemic Lens. Internal
+    state metadata (e.g., failure counters) are strictly excluded to force
+    the LLM to perform temporal Δ deduction.
+
     Attributes:
         fire:                Active fire severity level.
         patient:             Medical casualty severity level.
         traffic:             Traffic congestion level.
-        consecutive_failures: Steps with insufficient response before cascade.
     """
 
     fire: FireLevel = FireLevel.NONE
     patient: PatientLevel = PatientLevel.NONE
     traffic: TrafficLevel = TrafficLevel.LOW
-    consecutive_failures: int = Field(default=0, ge=0)
 
 
 # ===========================================================================

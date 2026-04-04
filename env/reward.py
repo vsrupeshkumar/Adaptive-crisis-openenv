@@ -57,13 +57,8 @@ the zone's severity across **two** consecutive timesteps:
 
     Δ = ordinal_rank(current_severity) - ordinal_rank(previous_severity)
 
-    If Δ == 0  AND  ordinal_rank(previous_severity) > ordinal_rank(the step
-    before that)  → the agent halted the degradation.  Grant +2.0.
-
-Because the environment only exposes the *immediately* previous state, we
-proxy "was escalating in the prior step" by checking whether any zone already
-had a *consecutive_failures* count > 0 at the start of the current step (this
-is set by ``_resolve_zone`` when the previous action was insufficient).
+    If Δ == 0  AND  previous_failures[zone_id] > 0  → the agent halted the
+    degradation.  Grant +2.0.
 
 Degradation Penalty — Design Rationale
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -173,7 +168,7 @@ class RewardConstants:
     # ---------------------------------------------------------------------------
 
     #: Bonus granted when a zone's incident severity was actively escalating
-    #: (consecutive_failures > 0 in the previous state) but the agent's
+    #: (previous_failures > 0 in the previous state) but the agent's
     #: dispatch this step successfully **halted** the degradation trajectory
     #: (severity rank Δ == 0 between previous_state and current_state).
     #:
@@ -377,7 +372,10 @@ def _zone_reward(
     # Step 2 — Empty zone: penalise wasted dispatches
     # ------------------------------------------------------------------ #
     if not has_incident:
-        if dispatch.dispatch_fire > 0 or dispatch.dispatch_ambulance > 0:
+        # Anti-Exploit Enforced: Unified Dimensional Penalty. Prevents 'Zero-Cost Action' free-riding
+        # by ensuring all resource deployments (including boolean support actions like police)
+        # incur strict waste penalties in safe zones.
+        if dispatch.dispatch_fire > 0 or dispatch.dispatch_ambulance > 0 or dispatch.control_traffic:
             # Wasting resources on a safe zone is a form of over-allocation.
             logger.debug("[%s] Wasted dispatch on safe zone → OVER_ALLOCATION", zone_id)
             zone_reward += RewardConstants.OVER_ALLOCATION
@@ -520,38 +518,24 @@ def _zone_reward(
 # Trajectory-Aware Shaping — pure Δ-severity helper
 # ---------------------------------------------------------------------------
 
-def _trajectory_shaping(
+def _trajectory_reward(
     zone_id: str,
     current_zone: ZoneState,
     previous_zone: ZoneState,
+    previous_failures: Optional[Dict[str, int]] = None,
 ) -> float:
-    """Δ-severity shaping: Stabilization Bonus and Degradation Penalty.
+    """Evaluate temporally shaped reward components (Δ values).
 
-    **Trajectory-Aware Reward Shaping** computes the difference in ordinal
-    severity rank between two consecutive observations of the same zone and
-    translates that Δ into a signed shaping bonus or penalty.
+    Detects if incidents worsened (DEGRADATION_PENALTY) or if a worsening
+    incident was successfully halted (STABILIZATION_BONUS).
 
-    This is a **pure function** — no side-effects, deterministic.
-
-    Algorithm
-    ---------
-    For each incident type (fire, patient) in the zone:
-
-    1.  Compute Δ_fire = _FIRE_RANK[current.fire] - _FIRE_RANK[previous.fire]
-        Compute Δ_patient = _PATIENT_RANK[current.patient] - _PATIENT_RANK[previous.patient]
-
-    2.  **Degradation Penalty** (``Δ > 0``):
-        The incident escalated between steps.  This indicates the previous
-        dispatch was insufficient (or the zone was ignored entirely).  We
-        apply ``DEGRADATION_PENALTY = -3.0`` immediately so the agent can
-        learn from the gradient before the cascade event fires.
-
-    3.  **Stabilization Bonus** (``Δ == 0`` AND the zone was previously
-        deteriorating, indicated by ``previous_zone.consecutive_failures > 0``):
-        The agent halted a worsening trajectory without necessarily resolving
-        the incident outright.  This is the hardest skill to learn — knowing
-        exactly how many resources to send to stop (but not over-respond to) a
-        cascading incident.  We reward it with ``STABILIZATION_BONUS = +2.0``.
+    **Stabilization Logic**:
+    If Δ == 0 (severity held steady) and the zone was *previously*
+    deteriorating, indicated by ``previous_failures[zone_id] > 0``:
+    The agent halted a worsening trajectory without necessarily resolving
+    the incident outright.  This is the hardest skill to learn — knowing
+    exactly how many resources to send to stop (but not over-respond to) a
+    cascading incident.  We reward it with ``STABILIZATION_BONUS = +2.0``.
 
     When Δ < 0 (severity *decreased*) no shaping is applied here because
     the base ``_zone_reward`` already grants CORRECT_ALLOCATION (+2.0) and
@@ -561,6 +545,8 @@ def _trajectory_shaping(
         zone_id:       Zone name (for debug logging only).
         current_zone:  Zone state in the *current* step observation.
         previous_zone: Zone state in the *previous* step observation.
+        previous_failures: Dictionary mapping zone IDs to their failure
+                       counters from the *previous* step.
 
     Returns:
         A float representing the net shaping bonus/penalty for this zone.
@@ -568,6 +554,10 @@ def _trajectory_shaping(
     """
     rc = RewardConstants
     shaping: float = 0.0
+    
+    prev_fails = 0
+    if previous_failures is not None:
+        prev_fails = previous_failures.get(zone_id, 0)
 
     # ---- Fire severity delta ----------------------------------------------- #
     delta_fire = _FIRE_RANK[current_zone.fire] - _FIRE_RANK[previous_zone.fire]
@@ -583,15 +573,14 @@ def _trajectory_shaping(
         )
         shaping += rc.DEGRADATION_PENALTY
 
-    elif delta_fire == 0 and previous_zone.consecutive_failures > 0 and current_zone.fire != FireLevel.NONE:
-        # Fire severity *held steady* while the zone was previously deteriorating
-        # (consecutive_failures > 0 means the prior step was insufficient).
+    elif delta_fire == 0 and prev_fails > 0 and current_zone.fire != FireLevel.NONE:
+        # Fire severity *held steady* while the zone was previously deteriorating.
         # This indicates the agent's current dispatch successfully stabilised the
         # fire — halting the cascade trajectory.
         logger.debug(
             "[%s] Fire stabilized (level=%s, prev_failures=%d) → STABILIZATION_BONUS (+%.1f)",
             zone_id,
-            current_zone.fire.value, previous_zone.consecutive_failures, rc.STABILIZATION_BONUS,
+            current_zone.fire.value, prev_fails, rc.STABILIZATION_BONUS,
         )
         shaping += rc.STABILIZATION_BONUS
 
@@ -609,13 +598,13 @@ def _trajectory_shaping(
 
     elif (
         delta_patient == 0
-        and previous_zone.consecutive_failures > 0
+        and prev_fails > 0
         and current_zone.patient not in (PatientLevel.NONE, PatientLevel.FATAL)
     ):
         logger.debug(
             "[%s] Patient stabilized (level=%s, prev_failures=%d) → STABILIZATION_BONUS (+%.1f)",
             zone_id,
-            current_zone.patient.value, previous_zone.consecutive_failures, rc.STABILIZATION_BONUS,
+            current_zone.patient.value, prev_fails, rc.STABILIZATION_BONUS,
         )
         shaping += rc.STABILIZATION_BONUS
 
@@ -630,6 +619,7 @@ def calculate_step_reward(
     current_state: Observation,
     action: Action,
     previous_state: Observation,
+    previous_failures: Optional[Dict[str, int]] = None,
 ) -> Reward:
     """Compute a dense structured Reward ledger for a single simulation step.
 
@@ -669,6 +659,8 @@ def calculate_step_reward(
                         Used by the trajectory-shaping layer to compute Δ.
                         On step 1 this is the pre-tick snapshot of the initial
                         observation (a valid fallback with no cascades yet).
+        previous_failures: Internal environment dictionary mapping zone IDs
+                           to their failure counters from the *previous* step.
 
     Returns:
         A populated ``Reward`` Pydantic object.  Call ``.total_reward`` for the
@@ -689,7 +681,9 @@ def calculate_step_reward(
         # not exist in the prior observation (e.g., dynamically spawned), we
         # fall back to the current state, producing a Δ of zero (no shaping).
         prev_zone_state: ZoneState = previous_state.zones.get(zone_id, zone_state)
-        shaping_contribution = _trajectory_shaping(zone_id, zone_state, prev_zone_state)
+        shaping_contribution = _trajectory_reward(
+            zone_id, zone_state, prev_zone_state, previous_failures
+        )
 
         zone_total = base_contribution + shaping_contribution
         logger.debug(
@@ -721,44 +715,62 @@ def calculate_step_reward(
     )
 
 
-# ---------------------------------------------------------------------------
-# Context-Grounded Semantic Grader — NLP broadcast bonus
-# ---------------------------------------------------------------------------
-
 def calculate_nlp_bonus(message: str, current_state: Observation) -> float:
     """Evaluate the agent's public broadcast message against the current crisis state.
 
-    **Context-Grounded Semantic Grader** — Design Philosophy
-    ---------------------------------------------------------
-    A naive reward (+0.5 if message non-empty) creates a free-rider
-    vulnerability: the agent learns to output ``"hello"`` and pocket the bonus
-    without providing any real public-safety value.
+    Anti-Cheating Enforced: Utilizes a Precision-Recall penalty model
+    (λ = 0.5) and Anti-Bloat bounds to mathematically neutralize
+    keyword-stuffing exploits.
 
-    This grader prevents that by anchoring the bonus to the *content* of the
-    message relative to what is objectively happening in the simulation.  The
-    score is a three-component additive matrix that rewards specificity and
-    penalises generic text by withholding partial scores for each missing element.
+    **Precision-Recall Penalty Model** — Design Philosophy
+    -------------------------------------------------------
+    The legacy additive grader was vulnerable to keyword stuffing: an agent
+    that outputs every possible hazard keyword guaranteed a perfect score
+    regardless of relevance.  This function replaces it with:
 
-    Scoring Matrix (max 1.0 points)
-    --------------------------------
-    +----------------------------------+-------+----------------------------------+
-    | Component                        | Score | Condition                        |
-    +==================================+=======+==================================+
-    | Base Match (zone name)           |  0.4  | message.lower() contains zone ID |
-    +----------------------------------+-------+----------------------------------+
-    | Hazard Match (keyword)           |  0.3  | fire critical: fire/blaze/burn   |
-    |                                  |       | medical critical: medical/hospital|
-    +----------------------------------+-------+----------------------------------+
-    | Action Match (directive verb)    |  0.3  | evacuate/shelter/avoid/warning   |
-    +----------------------------------+-------+----------------------------------+
+        R_nlp = max(0.0,
+                    Σ_{i ∈ Valid}   w_i · 𝟙_i
+                  - λ · Σ_{j ∈ Invalid} 𝟙_j)
 
-    Anti-cheating properties
-    ------------------------
-    * Message must name the CORRECT zone for Base Match (wrong zone = 0).
-    * Hazard keywords are TYPE-specific (fire vs medical, not interchangeable).
-    * All three components are independent: possible scores are any subset.
+    Where:
+        Valid    = keywords that are ACTUALLY active in the current ZoneState.
+        Invalid  = tracked keywords present in message but NOT active (false positives).
+        w_i      = per-component weight (0.4 zone / 0.3 hazard / 0.3 action).
+        λ        = 0.5  (hallucination penalty per false-positive keyword hit).
 
-    This is a **pure function** — no side-effects, deterministic.
+    Anti-Bloat Constraint
+    ---------------------
+    Messages exceeding 200 characters are treated as a keyword-stuffing attempt
+    or unhelpful verbosity.  An additional bloat_penalty of -0.5 is applied to
+    the computed score before the zero-floor clamp.
+
+    Zero-Floor Bound
+    ----------------
+    The final returned value is clamped to max(0.0, score) so the NLP
+    sub-reward cannot infinitely drag down the primary dispatch reward —
+    the worst outcome is simply forfeiting the bonus.
+
+    Scoring Matrix (max 1.0 points, before penalties)
+    --------------------------------------------------
+    +---------------------------------+-------+-------------------------------------+
+    | Component                       | Score | Condition                           |
+    +=================================+=======+=====================================+
+    | Base Match (zone name)          |  0.4  | Message names the most critical zone |
+    +---------------------------------+-------+-------------------------------------+
+    | Hazard Match (active type only) |  0.3  | Correct hazard keyword for zone type |
+    +---------------------------------+-------+-------------------------------------+
+    | Action Match (directive verb)   |  0.3  | Actionable directive present         |
+    +---------------------------------+-------+-------------------------------------+
+
+    Penalty Matrix
+    --------------
+    +-----------------------------+--------+-----------------------------------------------+
+    | Penalty                     | Amount | Trigger                                       |
+    +=============================+========+===============================================+
+    | Hallucination (per keyword) |  -0.5  | Tracked keyword in message but NOT active     |
+    +-----------------------------+--------+-----------------------------------------------+
+    | Anti-Bloat                  |  -0.5  | Message length > 200 characters               |
+    +-----------------------------+--------+-----------------------------------------------+
 
     Args:
         message:       The agent's public_broadcast_message string.
@@ -766,13 +778,40 @@ def calculate_nlp_bonus(message: str, current_state: Observation) -> float:
 
     Returns:
         A float in ``[0.0, 1.0]`` representing the graded broadcast quality.
+        Always non-negative (zero-floored).
     """
     if not message:
         return 0.0
 
     msg_lower = message.lower()
 
-    # ---- Identify the most critical zone ----------------------------------- #
+    # =========================================================================
+    # BUILD KEYWORD UNIVERSE: every tracked keyword across the entire system.
+    # These are the words an agent can be penalised for hallucinating.
+    # =========================================================================
+    ALL_ZONE_KEYWORDS: frozenset[str] = frozenset(
+        z_id.lower() for z_id in current_state.zones
+    )
+    ALL_FIRE_KEYWORDS: frozenset[str] = frozenset(
+        {"fire", "blaze", "burn", "flames", "inferno"}
+    )
+    ALL_MEDICAL_KEYWORDS: frozenset[str] = frozenset(
+        {"medical", "hospital", "injury", "casualty", "patient", "ambulance"}
+    )
+    ALL_TRAFFIC_KEYWORDS: frozenset[str] = frozenset(
+        {"gridlock", "traffic", "congestion", "blockage"}
+    )
+    ALL_TRACKED: frozenset[str] = (
+        ALL_ZONE_KEYWORDS | ALL_FIRE_KEYWORDS | ALL_MEDICAL_KEYWORDS | ALL_TRAFFIC_KEYWORDS
+    )
+
+    # =========================================================================
+    # BUILD ACTIVE KEYWORD SET: keywords warranted by the CURRENT ZoneState.
+    # Only these keywords earn positive scores; all others are hallucinations.
+    # =========================================================================
+    active_keywords: set[str] = set()
+
+    # Identify the single most critical zone (highest severity).
     best_score = 0
     critical_zone_id: str = ""
     critical_is_fire: bool = True
@@ -780,62 +819,118 @@ def calculate_nlp_bonus(message: str, current_state: Observation) -> float:
     for zone_id, z in current_state.zones.items():
         zone_severity = 0
         zone_fire_critical = True
+
         if z.fire == FireLevel.CATASTROPHIC:
             zone_severity = 100
         elif z.fire == FireLevel.HIGH:
             zone_severity = 50
-        if z.patient == PatientLevel.CRITICAL:
-            if 80 > zone_severity:
-                zone_severity = 80
-                zone_fire_critical = False
+        elif z.fire == FireLevel.MEDIUM:
+            zone_severity = 25
+
+        if z.patient == PatientLevel.CRITICAL and 80 > zone_severity:
+            zone_severity = 80
+            zone_fire_critical = False
+
+        # Populate active keyword set for this zone.
+        if z.fire not in (FireLevel.NONE,):
+            active_keywords.update(ALL_FIRE_KEYWORDS)
+        if z.patient not in (PatientLevel.NONE, PatientLevel.FATAL):
+            active_keywords.update(ALL_MEDICAL_KEYWORDS)
+        if z.traffic in (TrafficLevel.HEAVY, TrafficLevel.GRIDLOCK):
+            active_keywords.update(ALL_TRAFFIC_KEYWORDS)
+        
+        if zone_severity > 0:
+            active_keywords.add(zone_id.lower())
+
         if zone_severity > best_score:
             best_score = zone_severity
             critical_zone_id = zone_id
             critical_is_fire = zone_fire_critical
 
     if not critical_zone_id or best_score == 0:
+        # No active crisis → no valid bonus available.
         return 0.0
 
+    # =========================================================================
+    # ANTI-BLOAT CONSTRAINT: messages > 200 chars are penalised immediately.
+    # =========================================================================
+    _MAX_MESSAGE_LENGTH = 200
+    bloat_penalty: float = 0.0
+    if len(message) > _MAX_MESSAGE_LENGTH:
+        bloat_penalty = -0.5
+        logger.warning(
+            "NLP Anti-Bloat: message length %d > %d → bloat_penalty=-0.5",
+            len(message), _MAX_MESSAGE_LENGTH,
+        )
+
+    # =========================================================================
+    # PRECISION-RECALL SCORING: positive weights for valid hits.
+    # =========================================================================
     nlp_score: float = 0.0
 
-    # ---- Component 1: Base Match (0.4) ------------------------------------- #
+    # ---- Component 1: Base Match (0.4) — must name the correct critical zone — #
     if critical_zone_id.lower() in msg_lower:
         nlp_score += 0.4
-        logger.debug("NLP Base Match: '%s' found in message -> +0.4", critical_zone_id)
+        logger.debug("NLP Base Match: '%s' found → +0.4", critical_zone_id)
 
-    # ---- Component 2: Hazard Match (0.3) ----------------------------------- #
+    # ---- Component 2: Hazard Match (0.3) — correct hazard type only --- #
     if critical_is_fire:
-        fire_keywords = {"fire", "blaze", "burn", "flames", "inferno"}
-        if any(kw in msg_lower for kw in fire_keywords):
+        if any(kw in msg_lower for kw in ALL_FIRE_KEYWORDS):
             nlp_score += 0.3
-            logger.debug("NLP Hazard Match (fire): keyword found -> +0.3")
+            logger.debug("NLP Hazard Match (fire) → +0.3")
     else:
-        medical_keywords = {"medical", "hospital", "injury", "casualty", "patient", "ambulance"}
-        if any(kw in msg_lower for kw in medical_keywords):
+        if any(kw in msg_lower for kw in ALL_MEDICAL_KEYWORDS):
             nlp_score += 0.3
-            logger.debug("NLP Hazard Match (medical): keyword found -> +0.3")
+            logger.debug("NLP Hazard Match (medical) → +0.3")
 
-    # ---- Component 3: Action Match (0.3) ----------------------------------- #
-    directive_verbs = {"evacuate", "shelter", "avoid", "warning", "alert", "flee", "leave"}
-    if any(verb in msg_lower for verb in directive_verbs):
+    # ---- Component 3: Action Match (0.3) — directive verbs only -------- #
+    _DIRECTIVE_VERBS = frozenset({"evacuate", "shelter", "avoid", "warning", "alert", "flee", "leave"})
+    if any(verb in msg_lower for verb in _DIRECTIVE_VERBS):
         nlp_score += 0.3
-        logger.debug("NLP Action Match: directive verb found -> +0.3")
+        logger.debug("NLP Action Match: directive verb found → +0.3")
+
+    # =========================================================================
+    # FALSE POSITIVE SCANNER (λ = 0.5 per hallucinated keyword).
+    # =========================================================================
+    _LAMBDA: float = 0.5
+    hallucination_count: int = 0
+
+    for tracked_kw in ALL_TRACKED:
+        if tracked_kw in msg_lower and tracked_kw not in active_keywords:
+            hallucination_count += 1
+            logger.debug(
+                "NLP False Positive: keyword '%s' in message but NOT active → -%.1f",
+                tracked_kw, _LAMBDA,
+            )
+
+    hallucination_penalty: float = _LAMBDA * hallucination_count
+
+    # =========================================================================
+    # FINAL SCORE: apply penalties, then zero-floor.
+    # =========================================================================
+    raw_score = nlp_score - hallucination_penalty + bloat_penalty
+    final_score = max(0.0, raw_score)
 
     logger.info(
-        "NLP Grader: critical_zone=%s is_fire=%s msg=%r -> bonus=%.1f",
-        critical_zone_id, critical_is_fire, message[:60], nlp_score,
+        "NLP Grader | critical_zone=%s is_fire=%s | "
+        "raw_pos=%.1f hallucinations=%d(×%.1f) bloat=%.1f | "
+        "raw=%.2f → final=%.2f | msg=%r",
+        critical_zone_id, critical_is_fire,
+        nlp_score, hallucination_count, _LAMBDA, bloat_penalty,
+        raw_score, final_score,
+        message[:60],
     )
-    return nlp_score
+    return final_score
 
 
 # ---------------------------------------------------------------------------
 # Backward-compatibility shim — environment.py calls compute_reward()
-# ---------------------------------------------------------------------------
 
 def compute_reward(
     action: Action,
     obs: Observation,
     previous_state: Optional[Observation] = None,
+    previous_failures: Optional[Dict[str, int]] = None,
 ) -> tuple[float, bool]:
     """Backward-compatible wrapper used by ``environment.py``.
 
@@ -872,6 +967,7 @@ def compute_reward(
         current_state=obs,
         action=action,
         previous_state=prior,
+        previous_failures=previous_failures,
     )
 
     # ---- Layer 3: Context-Grounded Semantic Grader (NLP broadcast bonus) -- #

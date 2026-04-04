@@ -261,6 +261,12 @@ class CrisisManagementEnv:
         self._wasted_dispatches: float = 0.0  # Blocker #2: severity-weighted waste accumulator.
         self._prev_obs: Optional[Observation] = None  # Blocker #3: temporal shaping anchor.
 
+        # POMDP boundary: Track failure cascades internally here, NOT in the
+        # public Observation model which the agent receives.
+        self._zone_failures: Dict[str, int] = {
+            z_id: 0 for z_id in self.obs.zones.keys()
+        }
+
         logger.debug("Environment reset.  Total incidents: %d.", self._total_incidents)
         return self.obs.model_copy(deep=True)
 
@@ -436,6 +442,7 @@ class CrisisManagementEnv:
             current_state=self.obs,
             action=action,
             previous_state=temporal_prior,
+            previous_failures=self._zone_failures,
         )
         reward: float = step_reward_ledger.total_reward
         self._total_reward += reward
@@ -800,7 +807,7 @@ class CrisisManagementEnv:
         """Evaluate whether dispatched units are sufficient to resolve the zone.
 
         If the dispatch satisfies all incident requirements the incidents are
-        cleared.  Otherwise the zone's ``consecutive_failures`` counter is
+        cleared.  Otherwise the zone's internal failure counter is
         incremented and a cascade may be triggered.
 
         Args:
@@ -847,20 +854,21 @@ class CrisisManagementEnv:
             if used_pol > 0 and req_traffic:
                 zone_state.traffic = TrafficLevel.LOW
                 self._resolved_incidents += 1
-            zone_state.consecutive_failures = 0
+            self._zone_failures[zone_id] = 0
 
         # ---- Failure / cascading escalation ---------------------------------
         elif not is_sufficient and has_active:
-            zone_state.consecutive_failures += 1
-            if zone_state.consecutive_failures >= 3:
+            current_failures = self._zone_failures.get(zone_id, 0) + 1
+            self._zone_failures[zone_id] = current_failures
+            if current_failures >= 3:
                 logger.warning(
                     "CASCADING HAZARD TRIGGERED AT %s DUE TO LATENCY.", zone_id
                 )
                 self._escalate_zone(zone_state)
-                zone_state.consecutive_failures = 0
+                self._zone_failures[zone_id] = 0
         else:
             # No incidents — reset failure counter regardless.
-            zone_state.consecutive_failures = 0
+            self._zone_failures[zone_id] = 0
 
     @staticmethod
     def _escalate_zone(zone_state: ZoneState) -> None:
