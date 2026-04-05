@@ -74,6 +74,11 @@ echo "✅ Stage 2 passed."
 
 # Stage 3: openenv validate check
 echo "-> Stage 3/3: Executing openenv validity check..."
+# source virtual environment if available
+if [ -f ".venv/bin/activate" ]; then
+    source .venv/bin/activate
+fi
+
 if ! openenv validate openenv.yaml ; then
     echo "❌ CRITICAL ERROR: Stage 3 Failed. 'openenv validate openenv.yaml' encountered errors."
     echo "Deployment aborted."
