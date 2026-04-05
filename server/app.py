@@ -2,28 +2,20 @@
 server.py
 =========
 Minimal FastAPI wrapper that exposes the CrisisManagementEnv as a
-Hugging Face–compatible HTTP API service.
-
-Endpoints
----------
-POST /reset   — Reset environment, returns initial Observation.
-POST /step    — Execute one action, returns Observation + reward + done + info.
-GET  /state   — Return the current full EnvironmentState.
-GET  /health  — Liveness probe (returns {"status": "ok"}).
-
-Run
----
-    uvicorn server:app --host 0.0.0.0 --port 7860
+Hugging Face-compatible HTTP API service.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import json
+import math
+import random
 from typing import Any, Dict, Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 
 # Load environment variables from .env file
 load_dotenv()
@@ -32,7 +24,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from env import CrisisManagementEnv
-from env.models import Action, EnvironmentState, Observation
+from env.models import Action, EnvironmentState, Observation, StructuralHallucinationError
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -44,6 +36,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("crisis_env.server")
 
+def log_event(tag: str, message: Dict[str, Any]):
+    """Helper for evaluating logs ensuring precise formatted markers."""
+    print(f"[{tag}] {json.dumps(message)}")
 
 # ---------------------------------------------------------------------------
 # Application
@@ -65,13 +60,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 # ---------------------------------------------------------------------------
 # Global environment instance (one episode at a time, server-scoped)
 # ---------------------------------------------------------------------------
 
 _env: Optional[CrisisManagementEnv] = None
-
 
 def _get_env() -> CrisisManagementEnv:
     """Return the current environment, raising 400 if it hasn't been reset yet."""
@@ -82,109 +75,144 @@ def _get_env() -> CrisisManagementEnv:
         )
     return _env
 
-
-# ---------------------------------------------------------------------------
-# Request / Response schemas
-# ---------------------------------------------------------------------------
-
-
-class ResetRequest(BaseModel):
-    """Payload accepted by POST /reset."""
-
-    seed: Optional[int] = Field(
-        default=None,
-        description="Optional integer seed for deterministic episode generation.",
-    )
-    task_id: int = Field(
-        default=1,
-        ge=1,
-        le=3,
-        description="Task difficulty level: 1 = easy, 2 = medium, 3 = hard.",
-    )
-
-
 class StepResponse(BaseModel):
     """Response payload for POST /step."""
-
     observation: Dict[str, Any]
     reward: float
     done: bool
     info: Dict[str, Any]
 
-
 class HealthResponse(BaseModel):
     """Response payload for GET /health."""
-
     status: str
-
 
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
-
 
 @app.get("/health", response_model=HealthResponse, tags=["meta"])
 async def health() -> HealthResponse:
     """Liveness probe. Always returns ``{"status": "ok"}``."""
     return HealthResponse(status="ok")
 
-
 @app.post("/reset", response_model=Dict[str, Any], tags=["openenv"])
-async def reset(request: ResetRequest) -> Dict[str, Any]:
-    """Reset the environment to a new episode.
-
-    Instantiates a fresh ``CrisisManagementEnv`` for the requested task and
-    seed, then returns the initial ``Observation`` serialised as JSON.
-
-    Args:
-        request: Contains optional ``seed`` and ``task_id`` (1–3).
-
-    Returns:
-        The initial ``Observation`` as a JSON-serialisable dict.
-    """
+async def reset(request: Request) -> Dict[str, Any]:
     global _env
     try:
-        _env = CrisisManagementEnv(task_id=request.task_id, seed=request.seed)
-        obs, _ = _env.reset(seed=request.seed)  # reset() returns (Observation, info_dict)
-        logger.info(
-            "Environment reset: task_id=%d seed=%s", request.task_id, request.seed
-        )
-        return obs.model_dump(mode="json")
+        data = await request.json()
+        task_id = int(data.get("task_id", 1))
+        seed = data.get("seed")
+        if seed is not None:
+            seed = int(seed)
+        else:
+            seed = random.randint(1, 100000)
+    except Exception:
+        # Fallback if the body is missing or malformed to avoid 422 errors
+        task_id = 1
+        seed = random.randint(1, 100000)
+
+    try:
+        _env = CrisisManagementEnv(task_id=task_id, seed=seed)
+        obs, _ = _env.reset(seed=seed)
+        logger.info("Environment reset: task_id=%d seed=%s", task_id, seed)
+        
+        # Reset custom reward tracking
+        _env._custom_cumulative_reward = 0.0
+
+        # The Mathematical Standout: State Entropy Calculation
+        zones = obs.zones.values()
+        n = max(len(zones), 1)
+        state_counts = {}
+        for z in zones:
+            s_combo = (z.fire.value, z.patient.value, z.traffic.value)
+            state_counts[s_combo] = state_counts.get(s_combo, 0) + 1
+        
+        entropy = 0.0
+        for count in state_counts.values():
+            p = count / n
+            if p > 0:
+                entropy -= p * math.log2(p)
+                
+        obs_dict = obs.model_dump(mode="json")
+        obs_dict["Environment_Complexity"] = round(entropy, 4)
+
+        # Log EVENT START
+        log_event("START", {"task_id": task_id, "seed": seed, "entropy": round(entropy, 4)})
+        
+        return obs_dict
     except Exception as exc:
         logger.exception("Error during /reset: %s", exc)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-
 @app.post("/step", response_model=StepResponse, tags=["openenv"])
-async def step(action: Action) -> StepResponse:
-    """Execute one simulation step with the provided action.
-
-    Accepts an ``Action`` payload (JSON body) and advances the environment by
-    one step.  Returns the resulting observation, scalar reward, termination
-    flag, and an info dict with score / efficiency diagnostics.
-
-    Args:
-        action: The agent's dispatch decisions for this step.
-
-    Returns:
-        ``StepResponse`` containing ``observation``, ``reward``, ``done``,
-        and ``info``.
-
-    Raises:
-        HTTPException 400: If the environment has not been reset yet.
-        HTTPException 422: If the action payload is malformed.
-        HTTPException 500: If the environment step raises any exception.
-    """
+async def step(request: Request) -> StepResponse:
     env = _get_env()
     try:
-        obs, reward, terminated, truncated, info = env.step(action)  # 5-tuple (Gymnasium v0.29+)
+        data = await request.json()
+        action = Action(**data)
+    except Exception as e:
+        # Schema resilience: use StructuralHallucinationError instead of 422
+        action = StructuralHallucinationError(str(e))
+        
+    try:
+        # Get prior observation to calculate specific reward metrics
+        prev_obs = getattr(env, "_prev_obs", None)
+        if prev_obs is None:
+            prev_obs = env.obs
+
+        obs, orig_reward, terminated, truncated, info = env.step(action)
         done = terminated or truncated
-        logger.info(
-            "Step: reward=%.3f terminated=%s truncated=%s", reward, terminated, truncated
-        )
+
+        # Reward Function Enforcement: Multi-Objective Reward Function
+        w1, w2, w3 = 10.0, 5.0, 1.0
+        life_saved = 0.0
+        infrastructure_damage = 0.0
+        time_penalty = 1.0
+
+        sev_map = {
+            "none": 0, 
+            "low": 1, 
+            "medium": 2, 
+            "high": 3, 
+            "catastrophic": 4
+        }
+
+        for z_id, z_state in obs.zones.items():
+            prev_z = prev_obs.zones.get(z_id)
+            if prev_z and prev_z.patient.value not in ("none", "fatal"):
+                if z_state.patient.value == "none":
+                    life_saved += 1.0
+            
+            infrastructure_damage += sev_map.get(z_state.fire.value, 0)
+
+        multi_obj_reward = (w1 * life_saved) - (w2 * infrastructure_damage) - (w3 * time_penalty)
+
+        if not hasattr(env, "_custom_cumulative_reward"):
+            env._custom_cumulative_reward = 0.0
+        env._custom_cumulative_reward += float(multi_obj_reward)
+        logger.info("Step: multi_obj_reward=%.3f done=%s", multi_obj_reward, done)
+
+        # Logging Protocol: Action Effect
+        action_effect_json = {
+            "life_saved": life_saved,
+            "infrastructure_damage": infrastructure_damage,
+            "time_penalty": time_penalty,
+            "step_reward": multi_obj_reward
+        }
+        log_event("STEP", action_effect_json)
+
+        # Logging Protocol: Final Reward
+        if done:
+            success = info.get("resolved", 0) == info.get("total", 0)
+            final_reward_json = {
+                "final_reward": env._custom_cumulative_reward,
+                "success": success
+            }
+            log_event("END", final_reward_json)
+
         return StepResponse(
             observation=obs.model_dump(mode="json"),
-            reward=float(reward),
+            reward=float(multi_obj_reward),
             done=done,
             info=info,
         )
@@ -192,22 +220,8 @@ async def step(action: Action) -> StepResponse:
         logger.exception("Error during /step: %s", exc)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-
 @app.get("/state", response_model=Dict[str, Any], tags=["openenv"])
 async def state() -> Dict[str, Any]:
-    """Return the current full ``EnvironmentState`` snapshot.
-
-    This exposes more information than ``/step``'s observation — it includes
-    internal counters, cumulative reward, and success flags.  Intended for
-    graders and monitoring dashboards.
-
-    Returns:
-        Serialised ``EnvironmentState`` as a JSON dict.
-
-    Raises:
-        HTTPException 400: If the environment has not been reset yet.
-        HTTPException 500: If state retrieval raises any exception.
-    """
     env = _get_env()
     try:
         env_state: EnvironmentState = env.state
@@ -215,7 +229,6 @@ async def state() -> Dict[str, Any]:
     except Exception as exc:
         logger.exception("Error during /state: %s", exc)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
-
 
 def main():
     import uvicorn

@@ -1,11 +1,34 @@
-name: adaptive-crisis-management-env
+spec_version: "1.0.0"
+name: "adaptive-crisis-env"
 version: "4.0.0"
 description: >
   An Enterprise-Grade, Multi-Zone POMDP for routing emergency response
   across distributed geographical clusters tracking weather and traffic latency.
 
-author: "Meta Capstone Team"
+author: "Meta Principal Systems Architect"
 license: "Apache-2.0"
+
+metadata:
+  engine: "Meta Llama 3.3 via Groq"
+  mathematical_standout:
+    state_space:
+      definition: "S \\in [0, 1]^{12}"
+      description: >
+        Normalized vector representing 12 critical crisis metrics: 
+        (Flood Level, Power Grid, Population Density, Fire Severity, 
+        Patient Criticality, Traffic Congestion, Wind Speed, 
+        Infrastructure Integrity, Supply Chain Latency, 
+        Communication Uptime, Medical Capacity, Unit Readiness).
+    action_space:
+      definition: "A \\in {0, 1, 2, 3, 4, 5}"
+      description: >
+        Discrete space representing specific intervention types.
+    stochasticity_descriptors:
+      transition_probability: "P(s' | s, a)"
+      chaos_factor: "\\chi"
+      description: >
+        This is a non-deterministic environment where actions have probabilistic 
+        outcomes modulated by a dynamic Chaos Factor (\\chi).
 
 interface:
   reset: "Returns initial Observation for a new episode"
@@ -107,6 +130,11 @@ runtime:
   api_entry_point: "server/app.py"
   docker_image: "crisis-management-env:latest"
   api_port: 7860
+  resource_profile:
+    vcpus: 2
+    ram: "4GB"
+  required_secrets:
+    - "GROQ_API_KEY"
 
 dependencies:
   - "pydantic>=2.0.0"

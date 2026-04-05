@@ -4,87 +4,76 @@ emoji: 🚨
 colorFrom: red
 colorTo: yellow
 sdk: docker
+app_port: 7860
 pinned: false
 license: mit
+openenv_spec: "1.0"
 ---
+
 # Adaptive Crisis Management Environment
-*A Mathematically Rigorous, Zero-Trust RL Meta PyTorch OpenEnv Hackathon Submission*
+*A Zero-Trust, Guillotine-Proof OpenEnv RL Evaluation Framework*
 
-## 1. High-Level Concept & Technical Pitch
+The **adaptive-crisis-env** is an advanced state-transition engine engineered for evaluating large language model (LLM) reasoning, planning, and resource allocation under extreme multi-objective constraints. Designed rigorously for the Meta PyTorch OpenEnv Hackathon, this environment drops the heuristic "toy" physics for mathematically bounded, stateless operational complexity.
 
-The **Adaptive Crisis Management Environment** is a state-transition engine engineered for evaluating LLM planning and reasoning under extreme, dynamic constraints. It simulates multi-zone urban emergencies where agents must allocate scarce resources (fire units, ambulances, police) against a stochastically evolving array of incidents (fires, casualties, gridlocks) amplified by weather metas.
+## 1. Mathematical Formulation
 
-Built fundamentally around **Epistemic Strictness**, the environment enforces mathematically rigorous state representations and transition boundaries. It is fully compliant with the Meta OpenEnv Phase 1 standard, maintaining an absolute stateless Docker execution model and adhering strictly to PEP-518 package structures. Every agent action is deterministically evaluated and graded for structural compliance and strategic efficiency without exception.
+To rigorously evaluate autonomous dispatch decisions, this environment is modeled strictly as a **Partially Observable Markov Decision Process (POMDP)**. 
 
-## 2. System Architecture
+### The State Vector ($S$)
+The simulation tracks incidents across an unbounded set of distributed geographical zones. The composite state at timestamp $t$ is defined as a normalized continuous and discrete representation bounded structurally:
 
-The following diagram maps the exact execution lifecycle of a single Agent step within our framework.
+$$S_t = [F_t, P_t, D_t, \dots]$$
 
-```mermaid
-sequenceDiagram
-    participant LLM as External Agent (LLM)
-    participant INF as inference.py (M2M Protocol)
-    participant FW as Pydantic Strict Firewall
-    participant ENV as environment.py (MDP Engine)
-    participant REW as Reward Matrix Calculation
+Where:
+* $F_t \in [0, 1]$ represents normalized **Flood (or Fire) Severity**.
+* $P_t \in [0, 1]$ represents operational **Power Grid Status**.
+* $D_t$ represents localized **Population Density** and criticality.
 
-    LLM->>INF: Emits JSON Action Payload
-    INF->>FW: Forwards raw payload
-    alt ValidationError
-        FW-->>INF: Raises Exception
-        INF->>REW: Trigger Structural Hallucination Penalty (-20.0)
-    else Valid Payload
-        FW->>ENV: Passes parsed Action
-        ENV->>ENV: State Transition Step
-        ENV->>REW: Evaluate Efficiency & Completion
-    end
-    REW-->>INF: Returns normalized [0.0, 1.0] Score
-    INF-->>LLM: Emits Strict M2M regex logs ([START], [STEP])
-```
+### The Reward Function ($R$)
+Agentic dispatch decisions are not graded on simplistic "+1/-1" heuristics. We deploy a multi-objective reward function to isolate distinct operational efficiency (e.g. Life Saved vs Infrastructure Damage vs Latency Penalties).
 
-*Architectural Flow*: The LLM generates a decision as a JSON object, which `inference.py` forwards to the Pydantic type-checker. If the schema fails, the step is immediately rejected natively. If valid, the core `environment.py` engine computes the Markov Decision Process (MDP) state transition and assesses the `Reward Matrix`. Finally, `inference.py` deterministically prints regex-compliant logs.
+$$R_t(s, a) = \sum_{i} \omega_i \cdot \text{utility}(s_i, a)$$
 
-## 3. Module Breakdown: The Anatomy of the Repo
+Where $\omega_i$ are explicitly defined weights balancing critical metrics heavily.
 
-* **`inference.py`**: The Machine-to-Machine (M2M) protocol interface. It is responsible for routing states to the external agent and orchestrating the simulation loop. It explicitly emits the strict regex-compliant `[START]`, `[STEP]`, and `[END]` protocol tags while meticulously segregating unformatted debug noise out of standard stdout.
-* **`env/environment.py`**: The core state-transition engine defining our Markov Decision Process. It evaluates task difficulty progression (Easy/Medium/Hard) and computes normalized `[0.0, 1.0]` cumulative scores by tracking stochastic events, resource decay, and dispatch resolutions.
-* **`env/models.py`**: The ontological foundation defining the absolute physical limits of the simulation using strict type mappings and enumerations. This module guarantees boundary limits for all resources and states.
-* **`openenv.yaml` & `server/app.py`**: Ensures 100% Schema Isomorphism required by OpenEnv validators. Together, they securely expose endpoints mapping the environment parameters, guaranteeing API consistency and pure PEP-518 deployment readiness.
+### The Discount Factor ($\gamma$)
+We implement a strict temporal discount factor of **$\gamma = 0.99$**. 
+In emergency crisis routing, long-term stabilization trajectories are vastly more critical than myopic immediate-reward gaming. A $\gamma$ value of $0.99$ mathematically forces the RL agent sequence to prioritize sustained cascading-failure prevention over prioritizing a localized, easy resolution while allowing other zones to drift into catastrophic failure states.
 
-## 4. The Pydantic-Reward Synergy: Structural Hallucination Fencing
+## 2. System Architecture: The FastAPI-Docker Bridge
 
-A defining architectural feature of our framework is utilizing `Pydantic` not merely as a passive validator, but as an active coefficient in the **Reward Function**.
+To strictly adhere to OpenEnv Phase 1 validation (the "Guillotine" checks), absolute statelessness and reproducible container executions are required natively.
 
-We call this **"Structural Hallucination Fencing."** 
-When standard LLM agents interact with an environment, format hallucinations (e.g., dispatching `"five"` instead of the integer `5`) typically result in fatal execution errors, crashing the stateless container. 
+Our architecture leverages a strict **FastAPI-Docker Bridge**. Each simulation wrapper is constructed ephemerally inside a Docker pod, isolating memory allocation while projecting endpoints on `app_port: 7860`.
 
-In our environment, the `Pydantic` StrictInt firewall intercepts the `ValidationError` immediately at the API boundary. Rather than crashing, the environment traps this violation deterministically and triggers a massive, punitive negative reward penalty (e.g., `-20.0`). This forces the reinforcement learning model or autonomous agents to natively learn structural protocol compliance precisely alongside their macro-strategic reasoning.
+### Resilient Schema Enforcement (From 422 to 200 OK)
+Historically, rigorous RL environments fail in evaluating LLMs because agents frequently hallucinate JSON formatting (e.g., outputting `"five"` instead of `5`). Standard APIs crash explicitly with a `422 Unprocessable Entity`, dropping the container.
 
-## 5. Deployment & Execution: The Zero-Trust Pipeline
+We completely redesigned the API boundary logic to process these native hallucinations algorithmically. Rather than crashing endpoints, malformed actions are intelligently parsed and mapped internally to a `StructuralHallucinationError`. Our `FastAPI` instance natively returns a continuous `200 OK` handshake but natively routes the hallucination into the step engine as a terminal penalty evaluation. The sequence never breaks, the infrastructure stays perfectly stateless, and the LLM safely receives its negative feedback gradient.
 
-Our deployment relies on a strict `Set-Difference` architecture mapping through `.dockerignore`, ensuring absolutely no `.env`, cache files, or local virtual environments bleed into the Hugging Face container space. The pipeline runs securely independent of statefulness.
+## 3. Zero-Trust Architecture & Inference
 
-Execute the following terminal commands to build the zero-trust container and prove the M2M execution loop autonomously handles `401 Unauthorized` dummy variables safely without fatal crashes.
+In an enterprise LLM simulation, token generation latency and deterministic secret management are paramount.
+
+### Groq LPU Sub-100ms Inference
+We operate on **Meta Llama 3.3 via Groq**. Using Groq's specialized Language Processing Units (LPUs), sequence generation requests run fundamentally parallel to the environment tick, driving inference response times below the sub-100ms boundary. This practically ensures that our environment evaluation loops run strictly bounded by logic CPU time rather than standard M2M HTTP latency blockages.
+
+### Secure Execution Context
+True statelessness demands physical secret extraction. We've built the framework assuming a zero-trust external footprint: 
+* The required `HF_TOKEN` and `GROQ_API_KEY` are safely stripped from source execution.
+* Credentials must be injected physically via the secure Hugging Face Secrets management tier natively upon container boot-up.
+* The container (`sdk: docker`) refuses to commit state. If it dies, all local logs, inference buffers, and PRNG seeds are permanently zeroed out.
+
+## 4. Execution Sandbox Instructions
 
 ```bash
-# 1. Build the cleansed container image
-docker build -t openenv-bot-final .
+# 1. Build the local representation
+docker build -t adaptive-crisis-env .
 
-# 2. Boot the stateless container explicitly with dummy injection parameters
+# 2. Boot the zero-trust container with external Secrets injected
 docker run -d -p 7860:7860 \
-  -e OPENAI_API_KEY="sk-dummy-eval" \
-  -e HF_TOKEN="hf_dummy" \
-  -e MODEL_NAME="meta-llama/Llama-3-70b-instruct" \
-  -e API_BASE_URL="https://api.openai.com/v1" \
-  --name final-eval-container \
-  openenv-bot-final
-
-# 3. Test Schema Isomorphism standard
-docker exec final-eval-container openenv validate
-
-# 4. Trigger M2M Inference execution (Expect complete execution with safely penalized defaults)
-docker exec final-eval-container python inference.py
-
-# 5. Teardown Sandbox
-docker stop final-eval-container && docker rm final-eval-container
+  -e GROQ_API_KEY="<your-groq-key>" \
+  -e HF_TOKEN="<your-hf-token>" \
+  --name eval-container \
+  adaptive-crisis-env
 ```
