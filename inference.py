@@ -45,16 +45,18 @@ from dotenv import load_dotenv
 # ---------------------------------------------------------------------------
 load_dotenv()
 
+ENV_URL = os.getenv("ENV_URL", "http://localhost:7860")
+
 # ---------------------------------------------------------------------------
 # Third-party imports
 # ---------------------------------------------------------------------------
+import requests
 from openai import OpenAI, APIConnectionError, APIStatusError, APITimeoutError
 from pydantic import ValidationError
 
 # ---------------------------------------------------------------------------
 # Internal imports
 # ---------------------------------------------------------------------------
-from env import CrisisManagementEnv
 from env.models import (
     Action,
     FireLevel,
@@ -485,8 +487,12 @@ def run_episode(agent: LLMAgent, task_id: int) -> None:
     logger.info("=== Starting Task %d ===", task_id)
     agent.reset_history()
 
-    env     = CrisisManagementEnv(task_id=task_id)
-    obs, _  = env.reset()
+    response = requests.post(f"{ENV_URL}/reset", json={"task_id": task_id}, timeout=10)
+    response.raise_for_status()
+    # Assume the response JSON matches the Observation schema natively
+    obs_data = response.json()
+    # You may need to adjust how Observation is instantiated based on your model
+    obs = Observation(**obs_data)
     metrics = MetricsTracker()
 
     emit_start(str(task_id))
@@ -495,8 +501,9 @@ def run_episode(agent: LLMAgent, task_id: int) -> None:
     step_count:  int         = 0
     final_score: float       = 0.0
     success:     bool        = False
+    is_done:     bool        = False
 
-    while not env.is_done:
+    while not is_done:
         step_count += 1
 
         # ---- Introspective reasoning (logged before action) ----------------
@@ -518,8 +525,21 @@ def run_episode(agent: LLMAgent, task_id: int) -> None:
             action_json_str = '"FAILED_ACTION"'
 
         # ---- Environment step ----------------------------------------------
-        obs, reward, terminated, truncated, info = env.step(action)
-        done = terminated or truncated
+        step_res = requests.post(
+            f"{ENV_URL}/step", 
+            json={"action": action.model_dump(mode="json") if action != "FAILED_ACTION" else "FAILED_ACTION"}, 
+            timeout=10
+        )
+        step_res.raise_for_status()
+        step_data = step_res.json()
+
+        obs = Observation(**step_data["observation"])
+        reward = float(step_data["reward"])
+        # Safely extract done, accommodating both app.py's format and legacy format
+        done = step_data.get("done", step_data.get("terminated", False) or step_data.get("truncated", False))
+        info = step_data.get("info", {})
+        
+        is_done = done
         rewards.append(float(reward))
         metrics.update(reward, action, obs, done)
 
