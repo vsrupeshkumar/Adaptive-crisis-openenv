@@ -145,7 +145,7 @@ async def reset(request: ResetRequest) -> Dict[str, Any]:
     global _env
     try:
         _env = CrisisManagementEnv(task_id=request.task_id, seed=request.seed)
-        obs: Observation = _env.reset(seed=request.seed)
+        obs, _ = _env.reset(seed=request.seed)  # reset() returns (Observation, info_dict)
         logger.info(
             "Environment reset: task_id=%d seed=%s", request.task_id, request.seed
         )
@@ -177,9 +177,10 @@ async def step(action: Action) -> StepResponse:
     """
     env = _get_env()
     try:
-        obs, reward, done, info = env.step(action)
+        obs, reward, terminated, truncated, info = env.step(action)  # 5-tuple (Gymnasium v0.29+)
+        done = terminated or truncated
         logger.info(
-            "Step %d: reward=%.3f done=%s", obs.step, reward, done
+            "Step: reward=%.3f terminated=%s truncated=%s", reward, terminated, truncated
         )
         return StepResponse(
             observation=obs.model_dump(mode="json"),
@@ -209,18 +210,16 @@ async def state() -> Dict[str, Any]:
     """
     env = _get_env()
     try:
-        env_state: EnvironmentState = env.state()
+        env_state: EnvironmentState = env.state
         return env_state.model_dump(mode="json")
     except Exception as exc:
         logger.exception("Error during /state: %s", exc)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-# ---------------------------------------------------------------------------
-# Entrypoint (for direct execution, not needed with uvicorn CMD)
-# ---------------------------------------------------------------------------
+def main():
+    import uvicorn
+    uvicorn.run("server.app:app", host="0.0.0.0", port=7860, log_level="info")
 
 if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run("server:app", host="0.0.0.0", port=7860, log_level="info")
+    main()

@@ -76,57 +76,21 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="[%(levelname)s] %(name)s — %(message)s",
+    stream=sys.stderr,
 )
 logger = logging.getLogger("crisis_env.agent")
 
 
-# ===========================================================================
-# OpenEnv required structured logging helpers (stdout, flush=True)
-# ===========================================================================
+# M2M Protocol Functions (Zero Noise, stdout only)
+def emit_start(task_name: str):
+    print(f"[START] Task: {task_name}", file=sys.stdout, flush=True)
 
-def log_start(task: str, env: str, model: str) -> None:
-    print(f"[START] task={task} env={env} model={model}", flush=True)
+def emit_step(step_num: int, obs_dict: dict, action_str: str, reward: float):
+    # Mathematical precision: ensure reward is formatted as a float
+    print(f"[STEP] Step: {step_num} | Obs: {obs_dict} | Action: {action_str} | Reward: {float(reward):.2f}", file=sys.stdout, flush=True)
 
-
-def log_step(
-    step: int,
-    action: str,
-    reward: float,
-    done: bool,
-    error: Optional[str],
-) -> None:
-    error_val = error if error else "null"
-    done_val = str(done).lower()
-    print(
-        f"[STEP] step={step} action={action} reward={reward:.2f} "
-        f"done={done_val} error={error_val}",
-        flush=True,
-    )
-
-
-def log_think(step: int, critical: str, risk: str, strategy: str) -> None:
-    print(
-        f"[THINK] step={step} critical={critical} risk={risk} strategy={strategy}",
-        flush=True,
-    )
-
-
-def log_end(
-    success: bool,
-    steps: int,
-    score: float,
-    rewards: List[float],
-    efficiency: float = 0.95,
-    hazards_prevented: int = 0,
-    stability: float = 0.90,
-) -> None:
-    rewards_str = ",".join(f"{r:.2f}" for r in rewards)
-    print(
-        f"[END] success={str(success).lower()} steps={steps} score={score:.3f} "
-        f"efficiency={efficiency:.2f} hazards_prevented={hazards_prevented} "
-        f"stability={stability:.2f} rewards={rewards_str}",
-        flush=True,
-    )
+def emit_end(score: float):
+    print(f"[END] Score: {float(score):.2f}", file=sys.stdout, flush=True)
 
 
 # ===========================================================================
@@ -525,7 +489,7 @@ def run_episode(agent: LLMAgent, task_id: int) -> None:
     obs, _  = env.reset()
     metrics = MetricsTracker()
 
-    log_start(task=str(task_id), env="adaptive-crisis-management", model=agent.model)
+    emit_start(str(task_id))
 
     rewards:     List[float] = []
     step_count:  int         = 0
@@ -537,7 +501,7 @@ def run_episode(agent: LLMAgent, task_id: int) -> None:
 
         # ---- Introspective reasoning (logged before action) ----------------
         critical, risk, strategy = _assess_situation(obs)
-        log_think(step=step_count, critical=critical, risk=risk, strategy=strategy)
+        # Removed log_think to comply with M2M stream segregation
 
         # ---- LLM action decision -------------------------------------------
         try:
@@ -559,12 +523,11 @@ def run_episode(agent: LLMAgent, task_id: int) -> None:
         rewards.append(float(reward))
         metrics.update(reward, action, obs, done)
 
-        log_step(
-            step=step_count,
-            action=action_json_str,
+        emit_step(
+            step_num=step_count,
+            obs_dict=obs.model_dump(mode="json"),
+            action_str=action_json_str,
             reward=float(reward),
-            done=done,
-            error=step_error,
         )
 
         if done:
@@ -574,15 +537,7 @@ def run_episode(agent: LLMAgent, task_id: int) -> None:
 
     # ---- Episode summary (OpenEnv structured log line) --------------------
     summary = metrics.get_summary()
-    log_end(
-        success=success,
-        steps=step_count,
-        score=final_score,
-        rewards=rewards,
-        efficiency=summary["efficiency"],
-        hazards_prevented=summary["hazards_prevented"],
-        stability=summary["stability"],
-    )
+    emit_end(final_score)
     logger.info(
         "=== Task %d complete | success=%s | score=%.3f | steps=%d ===",
         task_id, success, final_score, step_count,

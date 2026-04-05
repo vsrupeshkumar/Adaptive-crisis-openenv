@@ -12,6 +12,7 @@ interface:
   step:  "Takes Action, returns (Observation, reward, done, info)"
   state: "Returns full EnvironmentState at any point"
 
+# Directive 4 Compliant: Epistemic Strictness enforced. No hidden simulation metadata.
 observation_space:
   type: structured
   schema: "env.models.Observation"
@@ -33,9 +34,6 @@ observation_space:
         traffic:
           type: enum
           values: [low, heavy, gridlock]
-        consecutive_failures:
-          type: int
-          minimum: 0
     idle_resources:
       type: object
       schema: "env.models.ResourcePool"
@@ -50,12 +48,6 @@ observation_space:
         fire_units: {type: int, minimum: 0}
         ambulances:  {type: int, minimum: 0}
         police:      {type: int, minimum: 0}
-    step:
-      type: int
-      minimum: 0
-    max_steps:
-      type: int
-      minimum: 1
     task_level:
       type: enum
       values: [easy, medium, hard]
@@ -112,7 +104,7 @@ runtime:
   language: python
   version: ">=3.10"
   entry_point: "inference.py"
-  api_entry_point: "server.py"
+  api_entry_point: "server/app.py"
   docker_image: "crisis-management-env:latest"
   api_port: 7860
 

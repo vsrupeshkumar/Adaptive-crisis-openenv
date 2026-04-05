@@ -5,3 +5,4 @@ fastapi>=0.100.0
 uvicorn>=0.22.0
 pyyaml>=6.0
 python-dotenv>=1.0.0
+openenv-core>=0.2.0

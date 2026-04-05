@@ -28,12 +28,8 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 # ---- Application source ----------------------------------------
-# Copy only what's needed at runtime — no venv, no dev tooling
-COPY env/           ./env/
-COPY inference.py   ./inference.py
-COPY server.py      ./server.py
-COPY openenv.yaml   ./openenv.yaml
-COPY metrics_tracker.py ./metrics_tracker.py
+# Set Difference Architecture: Copy everything, filtered strictly by .dockerignore
+COPY . .
 
 # ---- Transfer ownership to non-root user -----------------------
 RUN chown -R appuser:appuser /app
@@ -46,4 +42,4 @@ EXPOSE 7860
 
 # ---- Runtime ---------------------------------------------------
 # Hugging Face Spaces expects the service to bind on 0.0.0.0:7860
-CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "7860"]
+CMD ["uvicorn", "server.app:app", "--host", "0.0.0.0", "--port", "7860"]

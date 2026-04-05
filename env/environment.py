@@ -44,6 +44,7 @@ from env.models import (
 )
 from env.reward import compute_reward, calculate_step_reward
 from env.tasks import Task, create_task
+from openenv.core import Environment
 
 # ---------------------------------------------------------------------------
 # Module-level logger (engine diagnostics only — no UI formatting)
@@ -139,7 +140,7 @@ class _LifecycleManager:
 # Main Environment Class
 # ---------------------------------------------------------------------------
 
-class CrisisManagementEnv:
+class CrisisManagementEnv(Environment[Action, Observation, EnvironmentState]):
     """OpenEnv-compliant multi-zone crisis management RL environment.
 
     Directive 1 Compliance: Gymnasium v0.29+ API Enforced. The environment correctly
@@ -173,6 +174,7 @@ class CrisisManagementEnv:
             EnvironmentException: If ``task_id`` does not correspond to a
                 valid registered task.
         """
+        super().__init__()
         self.task_id: int = task_id
 
         try:
@@ -298,7 +300,7 @@ class CrisisManagementEnv:
             action: The agent's dispatching decisions for this step.
 
         Returns:
-            A 4-tuple of:
+            A 5-tuple of:
 
             - **obs** (``Observation``): New observation after the step.
             - **reward** (``float``): Shaped reward for this step.
@@ -764,6 +766,7 @@ class CrisisManagementEnv:
 
         return self.obs.model_copy(deep=True), float(reward), self._terminated, self._truncated, info
 
+    @property
     def state(self) -> EnvironmentState:
         """Return a complete internal snapshot of the environment.
 
