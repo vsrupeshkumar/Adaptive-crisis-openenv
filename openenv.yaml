@@ -124,6 +124,7 @@ grading:
   success_threshold: 0.5
 
 runtime:
+  type: docker
   language: python
   version: ">=3.10"
   entry_point: "inference.py"
