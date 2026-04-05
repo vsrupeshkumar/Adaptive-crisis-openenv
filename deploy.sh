@@ -40,17 +40,53 @@ docs: inject YAML frontmatter for HF Docker SDK compliance"
 fi
 
 # ==============================================================================
-# 3. THE DEPLOYMENT PIPELINE
+# 3. PRE-VALIDATION GATE
 # ==============================================================================
-echo "[3/3] Validating and deploying pipeline..."
+echo "[3/4] Executing 3-Stage Pre-Validation Gate..."
 
-# Mandatory execution boundary check
+HF_PING_URL=${1:-"https://anbu-00001-adaptive-crisis-env.hf.space"}
+
+# Stage 0: Mandatory execution boundary check
 if [[ ! -f "openenv.yaml" ]] || [[ ! -f "Dockerfile" ]]; then
-    echo "CRITICAL ERROR: Environment validation failed! Missing openenv.yaml or Dockerfile."
+    echo "❌ CRITICAL ERROR: Environment validation failed! Missing openenv.yaml or Dockerfile."
     echo "Aborting deployment to avoid standard OpenEnv Guillotine Failure."
     exit 1
 fi
-echo "Artifacts verified. Commencing synchronized push..."
+
+# Stage 1: Ping HF Space via /reset
+echo "-> Stage 1/3: Pinging HF Space (${HF_PING_URL}/reset)..."
+HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST "${HF_PING_URL}/reset" -H "Content-Type: application/json" -d '{}' || echo "000")
+if [ "$HTTP_STATUS" != "200" ]; then
+    echo "❌ CRITICAL ERROR: Stage 1 Failed. /reset endpoint returned HTTP $HTTP_STATUS."
+    echo "Deployment aborted."
+    exit 1
+fi
+echo "✅ Stage 1 passed."
+
+# Stage 2: Local Docker Build check
+echo "-> Stage 2/3: Validating Local Docker Build..."
+if ! docker build -t adaptive-crisis-env:validation . ; then
+    echo "❌ CRITICAL ERROR: Stage 2 Failed. Local Docker build encountered errors."
+    echo "Deployment aborted."
+    exit 1
+fi
+echo "✅ Stage 2 passed."
+
+# Stage 3: openenv validate check
+echo "-> Stage 3/3: Executing openenv validity check..."
+if ! openenv validate openenv.yaml ; then
+    echo "❌ CRITICAL ERROR: Stage 3 Failed. 'openenv validate openenv.yaml' encountered errors."
+    echo "Deployment aborted."
+    exit 1
+fi
+echo "✅ Stage 3 passed."
+
+echo "🚀 VALIDATION PASSED: Initiating Deployment..."
+
+# ==============================================================================
+# 4. THE DEPLOYMENT PIPELINE
+# ==============================================================================
+echo "[4/4] Executing push to remote tiers..."
 
 # Push parallel state to both instances (falling back to master if main doesn't exist)
 echo "Deploying to GitHub [Open-Source Tier]..."
