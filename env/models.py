@@ -58,6 +58,10 @@ _log = logging.getLogger("crisis_env.models")
 #: reward function.  Task resource caps apply on top of this.
 _MAX_DISPATCH_PER_ZONE: int = 50
 
+class StructuralHallucinationError(Exception):
+    """Raised when an LLM outputs malformed data outside the strict Action space."""
+    pass
+
 
 # ===========================================================================
 # Enums
@@ -162,48 +166,19 @@ class TaskConfig(BaseModel):
 class ResourcePool(BaseModel):
     """A snapshot of emergency-unit counts for one pool (idle *or* busy).
 
+    Directive 5 Compliance: Schema Brutality Enforced. Utilizing StrictInt
+    and StrictBool. No janitorial coercion permitted. All hallucinations result
+    in immediate terminal penalties to maintain gradient purity.
+
     Attributes:
         fire_units: Number of fire-fighting units in this pool.
         ambulances: Number of ambulance units in this pool.
         police:     Number of police units in this pool.
     """
 
-    fire_units: int = Field(default=0, ge=0)
-    ambulances: int = Field(default=0, ge=0)
-    police: int = Field(default=0, ge=0)
-
-    @field_validator("fire_units", "ambulances", "police", mode="before")
-    @classmethod
-    def _parse_resource_count(cls, raw: Any) -> int:
-        """Coerce and validate a resource count.
-
-        Accepts integers, floats (floor-truncated), and numeric strings.
-        Rejects non-numeric strings.  Negative values are clamped to 0.
-
-        Args:
-            raw: The raw value from whichever caller populated the field.
-
-        Returns:
-            A non-negative integer.
-
-        Raises:
-            ValueError: If ``raw`` cannot be interpreted as a number.
-        """
-        if isinstance(raw, bool):
-            # bool is a subclass of int in Python; reject it explicitly.
-            raise ValueError(
-                f"Resource count must be an integer, got boolean {raw!r}."
-            )
-        try:
-            coerced = int(float(str(raw)))
-        except (ValueError, TypeError):
-            raise ValueError(
-                f"Resource count must be a non-negative integer, got {raw!r}."
-            )
-        if coerced < 0:
-            _log.debug("Resource count %d clamped to 0.", coerced)
-            return 0
-        return coerced
+    fire_units: StrictInt = Field(default=0, ge=0)
+    ambulances: StrictInt = Field(default=0, ge=0)
+    police: StrictInt = Field(default=0, ge=0)
 
 
 class ActiveDeployment(BaseModel):
@@ -227,14 +202,16 @@ class ActiveDeployment(BaseModel):
 class ZoneState(BaseModel):
     """Current hazard state of a single city zone.
 
-    POMDP Boundary Enforced: This model acts as an Epistemic Lens. Internal
-    state metadata (e.g., failure counters) are strictly excluded to force
-    the LLM to perform temporal Δ deduction.
+    Directive 4 Compliance: Epistemic Lens active. No hidden state metadata
+    leaked. Agent must use temporal deduction — comparing current severity
+    against its conversation history to infer escalation trajectories.
+    Internal counters (e.g. consecutive_failures) are strictly excluded and
+    tracked only in the backend, never serialised into this model.
 
     Attributes:
-        fire:                Active fire severity level.
-        patient:             Medical casualty severity level.
-        traffic:             Traffic congestion level.
+        fire:    Active fire severity level.
+        patient: Medical casualty severity level.
+        traffic: Traffic congestion level.
     """
 
     fire: FireLevel = FireLevel.NONE
@@ -249,7 +226,15 @@ class ZoneState(BaseModel):
 class Observation(BaseModel):
     """Full environment observation returned after every ``reset()`` / ``step()``.
 
-    This is the *only* view of the world exposed to the agent.  Graders and
+    Directive 4 Compliance: Epistemic Lens active. No hidden state metadata
+    leaked. This model contains ONLY physically observable data. Internal
+    simulation counters (step number, max_steps, consecutive_failure counts)
+    are tracked exclusively as private backend attributes and are NEVER
+    serialised here. The agent must infer the passage of time and escalation
+    trajectories by comparing current zone states against its conversation
+    history — not by reading internal counters.
+
+    This is the *only* view of the world exposed to the agent. Graders and
     monitors receive ``EnvironmentState``, which is a strict superset.
 
     Attributes:
@@ -257,8 +242,6 @@ class Observation(BaseModel):
         zones:           Zone-id \u2192 ZoneState mapping.
         idle_resources:  Units available for dispatch this step.
         busy_resources:  Units currently deployed (on cooldown).
-        step:            Current step index (0 at episode start).
-        max_steps:       Truncation limit for this episode.
         task_level:      Difficulty tier this episode runs (``"easy"`` \u2026).
         previous_action_feedback: Plain-English delta summary injected by the
                          environment after every ``step()``.  Tells the agent
@@ -273,8 +256,9 @@ class Observation(BaseModel):
     zones: Dict[str, ZoneState]
     idle_resources: ResourcePool
     busy_resources: ResourcePool
-    step: int = Field(default=0, ge=0)
-    max_steps: int = Field(default=10, ge=1)
+    # Directive 4: step and max_steps are REMOVED from the agent-facing
+    # Observation. They are now private backend attributes in environment.py
+    # (self._step_count, self._max_steps) and are never leaked to the agent.
     task_level: TaskLevel = TaskLevel.EASY
     previous_action_feedback: Optional[str] = Field(
         default=None,
@@ -447,23 +431,6 @@ class Action(BaseModel):
         ),
     )
 
-    @field_validator("allocations", mode="before")
-    @classmethod
-    def _coerce_allocations(cls, raw: Any) -> Dict[str, Any]:
-        """Ensure ``allocations`` is always a dict, even if LLM omits it.
-
-        Args:
-            raw: Raw allocations payload.
-
-        """
-        if not isinstance(raw, dict):
-            raise ValueError(
-                f"Action Space Violation (allocations): Expected a JSON object (dict), "
-                f"got {type(raw).__name__!r}. The LLM must output a valid allocations mapping. "
-                "Null, list, and string payloads are outside the valid action space."
-            )
-        return raw
-
 
 # ===========================================================================
 # Environment State (full internal snapshot — superset of Observation)
@@ -551,11 +518,13 @@ class Reward(BaseModel):
     | base_dispatch_score           | Dispatch Quality       | [-9, 8] per zone |
     |                               | + Trajectory Shaping   | + [-3, 2]        |
     +-------------------------------+------------------------+------------------+
-    | nlp_semantic_bonus            | NLP Broadcast Bonus    | [0.0, 1.0]       |
+    | nlp_semantic_bonus            | NLP Broadcast Bonus    | (-∞, 1.0]        |
+    |                               | (CAN BE NEGATIVE —     |                  |
+    |                               |  Directive 3 penalty)  |                  |
     +-------------------------------+------------------------+------------------+
     | waste_penalty                 | Over-dispatch severity | [0.0, ∞)         |
     +-------------------------------+------------------------+------------------+
-    | **total_reward**              | Ledger sum             | ≈ -12 .. +11     |
+    | **total_reward**              | Ledger sum             | (-∞, +∞)         |
     +-------------------------------+------------------------+------------------+
 
     Attributes:
@@ -568,7 +537,8 @@ class Reward(BaseModel):
                               subtracted from total).
         total_reward:         The calculated sum:
                               ``base_dispatch_score + nlp_semantic_bonus
-                              - waste_penalty``.
+                              - waste_penalty``.  Not clamped — CAN be
+                              negative (Directive 3 compliance).
         dispatch_quality:     Layer 1 raw float (kept for backward compat).
         trajectory_shaping:   Layer 2 raw float (kept for backward compat).
         nlp_bonus:            Layer 3 raw float, mirrors nlp_semantic_bonus.
@@ -585,9 +555,11 @@ class Reward(BaseModel):
     )
     nlp_semantic_bonus: float = Field(
         default=0.0,
-        ge=0.0,
-        le=1.0,
-        description="Bonus (+0.5 max) awarded for generating contextually accurate natural language broadcasts.",
+        description=(
+            "NLP broadcast bonus — CAN BE NEGATIVE (Directive 3). "
+            "Subtracted hallucination (λ=0.5/kw) and bloat (γ=0.01/excess word) "
+            "penalties may outweigh positive keyword matches. No zero-floor clamp."
+        ),
     )
     waste_penalty: float = Field(
         default=0.0,
@@ -613,9 +585,10 @@ class Reward(BaseModel):
     )
     nlp_bonus: float = Field(
         default=0.0,
-        ge=0.0,
-        le=1.0,
-        description="Layer 3: Context-Grounded Semantic Grader score (0.0–1.0). Mirrors nlp_semantic_bonus.",
+        description=(
+            "Layer 3: Context-Grounded Semantic Grader score. "
+            "CAN BE NEGATIVE per Directive 3 — mirrors nlp_semantic_bonus."
+        ),
     )
     is_terminal: bool = Field(
         default=False,

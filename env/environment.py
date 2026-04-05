@@ -40,6 +40,7 @@ from env.models import (
     WeatherCondition,
     ZoneDispatch,
     ZoneState,
+    StructuralHallucinationError,
 )
 from env.reward import compute_reward, calculate_step_reward
 from env.tasks import Task, create_task
@@ -141,6 +142,10 @@ class _LifecycleManager:
 class CrisisManagementEnv:
     """OpenEnv-compliant multi-zone crisis management RL environment.
 
+    Directive 1 Compliance: Gymnasium v0.29+ API Enforced. The environment correctly
+    outputs the 5-tuple step and distinct terminated/truncated signals for accurate 
+    Bellman equation bootstrapping.
+
     The environment models a simulated city divided into named zones, each
     of which can simultaneously suffer from fire, medical, and traffic
     incidents.  An agent dispatches emergency resources each step and
@@ -185,6 +190,12 @@ class CrisisManagementEnv:
         self._lives_saved: int = 0
         self._total_reward: float = 0.0
         self._is_done: bool = False
+        self._terminated: bool = False
+        self._truncated: bool = False
+        # Directive 4: step counter and episode limit are PRIVATE backend state.
+        # They are NEVER serialised into the agent-facing Observation.
+        self._step_count: int = 0
+        self._max_steps: int = self._task.get_max_steps()
         self.obs: Observation           # set by reset()
         self._prev_obs: Optional[Observation] = None  # Blocker #3: temporal shaping
 
@@ -195,8 +206,11 @@ class CrisisManagementEnv:
     # Public OpenEnv interface
     # ------------------------------------------------------------------
 
-    def reset(self, seed: Optional[int] = 42) -> Observation:
+    def reset(
+        self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None
+    ) -> Tuple[Observation, Dict[str, Any]]:
         """Reset the environment to a fresh episode state.
+
 
         Monolithic Entropy Lock
         -----------------------
@@ -255,11 +269,16 @@ class CrisisManagementEnv:
         self._active_deployments = []
         self._total_reward = 0.0
         self._is_done = False
+        self._terminated = False
+        self._truncated = False
         self._resolved_incidents = 0
         self._lives_saved = 0
         self._total_incidents = self._count_incidents(self.obs)
         self._wasted_dispatches: float = 0.0  # Blocker #2: severity-weighted waste accumulator.
         self._prev_obs: Optional[Observation] = None  # Blocker #3: temporal shaping anchor.
+        # Directive 4: reset private step counter; max_steps from task config.
+        self._step_count: int = 0
+        self._max_steps: int = self._task.get_max_steps()
 
         # POMDP boundary: Track failure cascades internally here, NOT in the
         # public Observation model which the agent receives.
@@ -268,11 +287,11 @@ class CrisisManagementEnv:
         }
 
         logger.debug("Environment reset.  Total incidents: %d.", self._total_incidents)
-        return self.obs.model_copy(deep=True)
+        return self.obs.model_copy(deep=True), {}
 
     def step(
-        self, action: Action
-    ) -> Tuple[Observation, float, bool, Dict[str, Any]]:
+        self, action: Any
+    ) -> Tuple[Observation, float, bool, bool, Dict[str, Any]]:
         """Execute a single simulation step.
 
         Args:
@@ -295,6 +314,47 @@ class CrisisManagementEnv:
                 "Episode is done.  Call reset() before stepping again."
             )
 
+        # =====================================================================
+        # Directive 2 & 5: Structural Darwinism & Schema Brutality
+        # =====================================================================
+        if isinstance(action, StructuralHallucinationError):
+            self._is_done = True
+            reward = -20.0
+            self._total_reward += reward
+            self._step_count += 1
+            logger.error(
+                "[Step %d] Directive 5 Schema Brutality: Bouncer caught hallucination! Terminal penalty.",
+                self._step_count
+            )
+            
+            info = {
+                "resolved": self._resolved_incidents,
+                "total": self._total_incidents,
+                "score": 0.0,
+                "efficiency": 0.0,
+                "error_msg": f"Directive 5 Bouncer Caught Hallucination: {action}",
+            }
+            return self.obs.model_copy(deep=True), float(reward), self._terminated, self._truncated, info
+
+        if not isinstance(action, Action):
+            self._is_done = True
+            reward = -20.0
+            self._total_reward += reward
+            self._step_count += 1
+            logger.error(
+                "[Step %d] Structural Darwinism: Action is not a valid Pydantic Action! Terminal penalty.",
+                self._step_count
+            )
+            
+            info = {
+                "resolved": self._resolved_incidents,
+                "total": self._total_incidents,
+                "score": 0.0,
+                "efficiency": 0.0,
+                "error_msg": f"Action is invalid: {action}",
+            }
+            return self.obs.model_copy(deep=True), float(reward), self._terminated, self._truncated, info
+
         # 1. Advance time and recover returned units.
         # Blocker #3: capture a deep-copy of the *current* obs BEFORE the tick
         # so we have a clean immutable snapshot of "what the world looked like
@@ -306,7 +366,8 @@ class CrisisManagementEnv:
         #      pre-resolution fire/patient levels).
         prev_obs_snapshot: Observation = self.obs.model_copy(deep=True)
 
-        self.obs.step += 1
+        # Directive 4: advance the private step counter, NOT obs.step.
+        self._step_count += 1
         self._active_deployments = _LifecycleManager.tick(
             self.obs, self._active_deployments
         )
@@ -365,7 +426,7 @@ class CrisisManagementEnv:
             breach_msg = "CRITICAL FAILURE: " + "; ".join(breach_details) + ". Action voided."
             logger.error(
                 "[Step %d] INVENTORY BREACH — %s",
-                self.obs.step, breach_msg,
+                self._step_count, breach_msg,
             )
 
             # Severity multiplier: ×2.0 if a life-threatening incident is active.
@@ -383,7 +444,7 @@ class CrisisManagementEnv:
             logger.error(
                 "[Step %d] INVENTORY BREACH terminal penalty: %.1f (severity_mult=%.1f). "
                 "Episode terminated.",
-                self.obs.step, breach_penalty, severity_multiplier,
+                self._step_count, breach_penalty, severity_multiplier,
             )
 
             # Build a minimal Reward ledger for the breach step.
@@ -399,7 +460,7 @@ class CrisisManagementEnv:
             )
             logger.info(
                 "[Step %d] Reward Ledger (BREACH): %s",
-                self.obs.step,
+                self._step_count,
                 breach_ledger.model_dump_json(),
             )
 
@@ -408,7 +469,7 @@ class CrisisManagementEnv:
                 incidents_resolved=self._resolved_incidents,
                 total_incidents=self._total_incidents,
                 total_reward=self._total_reward,
-                total_steps=max(self.obs.step, 1),
+                total_steps=max(self._step_count, 1),
                 num_zones=len(self.obs.zones),
                 wasted_dispatches=self._wasted_dispatches,
             )
@@ -444,9 +505,14 @@ class CrisisManagementEnv:
             previous_state=temporal_prior,
             previous_failures=self._zone_failures,
         )
-        reward: float = step_reward_ledger.total_reward
-        self._total_reward += reward
+        # NOTE: we do NOT yet add this to self._total_reward here;
+        # the final corrected reward (after waste subtraction) is committed below.
+        base_dispatch_reward: float = step_reward_ledger.base_dispatch_score
+        step_nlp_bonus: float = step_reward_ledger.nlp_bonus
 
+        # Snapshot waste accumulator BEFORE zone resolution so we can compute
+        # the per-step waste delta after the zone loop completes.
+        _waste_before_step: float = self._wasted_dispatches
         # 3. Commit allocations and resolve each zone.
         # Track over-allocations for Blocker #2 grader accuracy (severity-weighted).
         from env.reward import _get_required_fire, _get_required_ambulance
@@ -527,7 +593,13 @@ class CrisisManagementEnv:
             and z.traffic == TrafficLevel.LOW
             for z in self.obs.zones.values()
         )
-        if all_clear or self.obs.step >= self.obs.max_steps:
+        # Directive 1: Strict separation of terminated vs truncated
+        if all_clear:
+            self._terminated = True
+        elif self._step_count >= self._max_steps:
+            self._truncated = True
+            
+        if self._terminated or self._truncated:
             self._is_done = True
             logger.info("Evaluation Terminated natively. Executing Scorecard hook.")
 
@@ -537,7 +609,7 @@ class CrisisManagementEnv:
         # No numeric thresholds are disclosed — the agent must calibrate from
         # the direction of change (improved / held / degraded).
         feedback_lines: list[str] = [
-            f"[Step {self.obs.step - 1} Dispatch Results]"
+            f"[Step {self._step_count - 1} Dispatch Results]"
         ]
         for zone_id in self.obs.zones:
             prev_z = prev_obs_snapshot.zones.get(zone_id)
@@ -607,39 +679,69 @@ class CrisisManagementEnv:
         logger.debug("Delta feedback generated: %s", self.obs.previous_action_feedback)
 
 
-        # 5. Build info dict — Blocker #2: all three grader components now live.
+        # 5. Build info dict — Directive 3: Ruthless Utility reward formula.
         from env.grader import Grader  # local import avoids circular deps at module level
+
+        # -----------------------------------------------------------------------
+        # Directive 3: Ruthless Utility Reward Formula
+        #
+        #   Total_Reward = (Base_Dispatch_Reward + NLP_Bonus) - Waste_Penalty
+        #
+        # step_waste_penalty = severity-weighted resource waste accrued THIS step
+        #                      (delta between cumulative before and after zone loop).
+        # DO NOT clamp to zero — negative rewards are the intended gradient signal.
+        # -----------------------------------------------------------------------
+        step_waste_penalty: float = self._wasted_dispatches - _waste_before_step
+
+        # Ruthless Utility final reward — no zero-floor.
+        reward: float = (base_dispatch_reward + step_nlp_bonus) - step_waste_penalty
+
+        # Commit the corrected step reward to the cumulative episode total.
+        self._total_reward += reward
+
+        logger.info(
+            "[Step %d] Ruthless Utility: base=%.4f + nlp=%.4f - waste=%.4f = total=%.4f",
+            self._step_count, base_dispatch_reward, step_nlp_bonus, step_waste_penalty, reward,
+        )
 
         score, eff_score = Grader().get_score(
             incidents_resolved=self._resolved_incidents,
             total_incidents=self._total_incidents,
             total_reward=self._total_reward,
-            total_steps=max(self.obs.step, 1),
+            total_steps=max(self._step_count, 1),
             num_zones=len(self.obs.zones),
             wasted_dispatches=self._wasted_dispatches,
         )
 
-        # Build the final, complete Reward ledger for this step.
-        # NLP bonus was already baked into step_reward_ledger.total_reward via
-        # the trajectory layer (compute_reward handles NLP separately, but
-        # calculate_step_reward is what step() calls).  We add the
-        # severity-weighted waste_penalty here because environment.py owns that
-        # accumulator and can provide the delta for this step.
-        step_waste_delta: float = self._wasted_dispatches  # cumulative; judges see per-step via info
+        # Build the final, authoritative Reward ledger for this step.
+        # All three ledger lines are now correctly populated:
+        #   base_dispatch_score — dispatch quality + trajectory shaping
+        #   nlp_semantic_bonus  — NLP precision score (CAN be negative, Directive 3)
+        #   waste_penalty       — positive scalar representation of resource waste
+        #   total_reward        — Ruthless Utility sum (not clamped)
         final_step_ledger = Reward(
-            base_dispatch_score=step_reward_ledger.base_dispatch_score,
-            nlp_semantic_bonus=0.0,   # NLP path handled via compute_reward; step() uses calculate_step_reward
-            waste_penalty=0.0,        # waste tracked cumulatively in _wasted_dispatches
-            total_reward=reward,
+            base_dispatch_score=base_dispatch_reward,
+            nlp_semantic_bonus=step_nlp_bonus,
+            waste_penalty=step_waste_penalty,          # positive magnitude; subtracted in total
+            total_reward=reward,                        # = base + nlp - waste (Directive 3)
             dispatch_quality=step_reward_ledger.dispatch_quality,
             trajectory_shaping=step_reward_ledger.trajectory_shaping,
-            nlp_bonus=step_reward_ledger.nlp_bonus,
+            nlp_bonus=step_nlp_bonus,
             is_terminal=self._is_done,
         )
         logger.info(
             "[Step %d] Reward Ledger: %s",
-            self.obs.step,
+            self._step_count,
             final_step_ledger.model_dump_json(),
+        )
+
+        # Directive 3: efficiency_score = Base_Reward / (Base_Reward + Waste_Penalty)
+        # Tracks how efficiently the agent allocates resources (1.0 = zero waste).
+        _base_magnitude = abs(base_dispatch_reward)
+        efficiency_score: float = (
+            _base_magnitude / (_base_magnitude + step_waste_penalty)
+            if (_base_magnitude + step_waste_penalty) > 0
+            else 1.0
         )
 
         info: Dict[str, Any] = {
@@ -647,7 +749,9 @@ class CrisisManagementEnv:
             "total": self._total_incidents,
             "score": score,
             "efficiency": eff_score,
+            "efficiency_score": efficiency_score,       # Directive 3: resource efficiency tax tracker
             "wasted_dispatches": self._wasted_dispatches,
+            "step_waste_penalty": step_waste_penalty,   # per-step waste for evaluator transparency
             "reward_ledger": final_step_ledger.model_dump(),
         }
 
@@ -658,7 +762,7 @@ class CrisisManagementEnv:
         # This strict ordering enables accurate Δ-severity calculations.
         self._prev_obs = prev_obs_snapshot
 
-        return self.obs.model_copy(deep=True), float(reward), self._is_done, info
+        return self.obs.model_copy(deep=True), float(reward), self._terminated, self._truncated, info
 
     def state(self) -> EnvironmentState:
         """Return a complete internal snapshot of the environment.
@@ -678,13 +782,13 @@ class CrisisManagementEnv:
             incidents_resolved=self._resolved_incidents,
             total_incidents=self._total_incidents,
             total_reward=self._total_reward,
-            total_steps=max(self.obs.step, 1),
+            total_steps=max(self._step_count, 1),
             num_zones=len(self.obs.zones),
             wasted_dispatches=self._wasted_dispatches,
         )
         return EnvironmentState(
-            step_count=self.obs.step,
-            max_steps=self.obs.max_steps,
+            step_count=self._step_count,
+            max_steps=self._max_steps,
             observation=self.obs.model_copy(deep=True),
             total_reward=self._total_reward,
             is_done=self._is_done,

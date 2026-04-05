@@ -63,6 +63,7 @@ from env.models import (
     TrafficLevel,
     WeatherCondition,
     ZoneDispatch,
+    StructuralHallucinationError,
 )
 from metrics_tracker import MetricsTracker
 
@@ -209,8 +210,15 @@ The exact resource thresholds are NOT given to you. Deduce them from feedback:
 - Zone ESCALATED → your dispatch was INSUFFICIENT. Increase next allocation.
 - Zone HELD STABLE → you matched minimum but did not exceed it. Adjust accordingly.
 
-## EPISTEMIC LENS: TEMPORAL DEDUCTION
-You do not have access to a failure counter. To determine if your previous dispatches were successful, you must cross-reference your past actions with the current severity levels in the observation. If a hazard's severity does not decrease, your allocation was insufficient and the zone is approaching a critical cascade.
+## EPISTEMIC LENS: TEMPORAL DEDUCTION (Directive 4)
+There are NO hidden counters or failure tallies in the observation. You will NOT see a step
+number or a failure count. You must track the efficacy of your actions over time by comparing
+the current zone states against your conversation history.
+
+If a hazard severity remains unchanged or increases since your last dispatch, your previous
+allocation was insufficient and the zone is escalating. Treat any zone that failed to improve
+as a higher triage priority this step. You must rely entirely on your internal reasoning to
+identify and respond to escalating zones — there are no shortcuts.
 
 ## HARD PHYSICAL CONSTRAINT — INVENTORY BREACH
 You CANNOT request more total resources than your current idle pool in any category
@@ -238,21 +246,18 @@ Respond with ONLY a valid JSON object — no markdown fences, no explanations, n
 class LLMAgent:
     """Production-grade LLM agent backed by the OpenAI Python client.
 
+    Directive 2 Compliance: Agentic Purity enforced. No retries, no fallbacks,
+    no sanitization. Structural hallucinations result in immediate terminal
+    penalties to ensure gradient integrity.
+
     All credentials and endpoint configuration are sourced exclusively from
     environment variables — no hardcoded values anywhere.
 
     Attributes:
         model:      Model identifier from ``MODEL_NAME`` env var.
         client:     Configured ``openai.OpenAI`` instance.
-        max_retries: Retry attempts per step before falling back to safe action.
         history:    Rolling conversation history (system + alternating user/assistant).
     """
-
-    #: Maximum retries on a single step before falling back.
-    MAX_RETRIES: int = 3
-
-    #: Base back-off delay in seconds between retries.
-    RETRY_BACKOFF_BASE: float = 1.0
 
     def __init__(self) -> None:
         api_base   = os.getenv("API_BASE_URL")
@@ -294,8 +299,8 @@ class LLMAgent:
         self,
         obs: Observation,
         step: int,
-    ) -> Tuple[Action, Optional[str]]:
-        """Query the LLM for a dispatch action, with a 3-retry safety net.
+    ) -> Tuple[Any, Optional[str]]:
+        """Query the LLM for a dispatch action with NO retries (Directive 2).
 
         The observation is serialised to JSON and sent as the user message.
         The LLM response is parsed back into a Pydantic ``Action`` model.
@@ -305,8 +310,8 @@ class LLMAgent:
             step: Current step number (for logging context).
 
         Returns:
-            A 2-tuple of ``(action, error_string)``.  ``error_string`` is
-            ``None`` on success, or a description of the last error on fallback.
+            A 2-tuple of ``(action, error_string)``.  If parsing fails, returns
+            ``("FAILED_ACTION", error)`` so the environment can apply a terminal penalty.
         """
         obs_json = obs.model_dump_json(indent=2)
         user_message = (
@@ -317,81 +322,49 @@ class LLMAgent:
         # Append user turn to rolling history (keeps context across steps).
         self._history.append({"role": "user", "content": user_message})
 
-        last_error: Optional[str] = None
+        try:
+            action, used_tokens, latency_ms = self._call_api(step, 1)
+            logger.info(
+                "Step %d | tokens_used=%s | latency=%.0fms",
+                step, used_tokens, latency_ms,
+            )
+            # Append assistant turn to history for continuity.
+            self._history.append(
+                {"role": "assistant", "content": action.model_dump_json()}
+            )
+            return action, None
 
-        for attempt in range(1, self.MAX_RETRIES + 1):
-            try:
-                action, used_tokens, latency_ms = self._call_api(step, attempt)
-                logger.info(
-                    "Step %d | attempt %d/%d | tokens_used=%s | latency=%.0fms",
-                    step, attempt, self.MAX_RETRIES,
-                    used_tokens, latency_ms,
-                )
-                # Append assistant turn to history for continuity.
-                self._history.append(
-                    {"role": "assistant", "content": action.model_dump_json()}
-                )
-                return action, None
+        except StructuralHallucinationError as hallucination_err:
+            logger.error(
+                "Step %d | STRUCTURAL HALLUCINATION — %s",
+                step, hallucination_err,
+            )
+            self._history.append(
+                {"role": "assistant", "content": '{"action": "FAILED_ACTION"}'}
+            )
+            raise  # Let run_episode catch it and pass to the environment
 
-            except (json.JSONDecodeError, ValidationError) as parse_err:
-                last_error = f"ParseError (attempt {attempt}): {parse_err}"
-                logger.warning(
-                    "Step %d | attempt %d/%d | PARSE FAILURE — %s",
-                    step, attempt, self.MAX_RETRIES, parse_err,
-                )
+        except json.JSONDecodeError as parse_err:
+            last_error = f"ParseError: {parse_err}"
+            logger.error(
+                "Step %d | PARSE FAILURE — %s",
+                step, parse_err,
+            )
+            self._history.append(
+                {"role": "assistant", "content": '{"action": "FAILED_ACTION"}'}
+            )
+            return "FAILED_ACTION", last_error
 
-            except (APIConnectionError, APITimeoutError) as conn_err:
-                last_error = f"ConnectionError (attempt {attempt}): {conn_err}"
-                logger.warning(
-                    "Step %d | attempt %d/%d | CONNECTION FAILURE — %s",
-                    step, attempt, self.MAX_RETRIES, conn_err,
-                )
-
-            except APIStatusError as status_err:
-                last_error = (
-                    f"APIStatusError {status_err.status_code} "
-                    f"(attempt {attempt}): {status_err.message}"
-                )
-                logger.error(
-                    "Step %d | attempt %d/%d | API STATUS %d — %s",
-                    step, attempt, self.MAX_RETRIES,
-                    status_err.status_code, status_err.message,
-                )
-                # 4xx errors (bad auth, quota) will not improve with retries.
-                if 400 <= status_err.status_code < 500:
-                    logger.error(
-                        "Step %d | 4xx error — aborting retries immediately.", step
-                    )
-                    break
-
-            except Exception as unexpected_err:
-                last_error = f"UnexpectedError (attempt {attempt}): {unexpected_err}"
-                logger.exception(
-                    "Step %d | attempt %d/%d | UNEXPECTED — %s",
-                    step, attempt, self.MAX_RETRIES, unexpected_err,
-                )
-
-            # Exponential back-off before next retry.
-            if attempt < self.MAX_RETRIES:
-                backoff = self.RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
-                logger.info(
-                    "Step %d | retrying in %.1fs (attempt %d → %d).",
-                    step, backoff, attempt, attempt + 1,
-                )
-                time.sleep(backoff)
-
-        # All retries exhausted — emit safe fallback action.
-        logger.error(
-            "Step %d | ALL %d retries exhausted. Falling back to SAFE_ZERO action. "
-            "Last error: %s",
-            step, self.MAX_RETRIES, last_error,
-        )
-        fallback = self._safe_fallback_action(obs)
-        # Replace last user message with fallback indicator so history stays clean.
-        self._history.append(
-            {"role": "assistant", "content": '{"fallback": true}'}
-        )
-        return fallback, last_error
+        except Exception as unexpected_err:
+            last_error = f"UnexpectedError: {unexpected_err}"
+            logger.exception(
+                "Step %d | UNEXPECTED — %s",
+                step, unexpected_err,
+            )
+            self._history.append(
+                {"role": "assistant", "content": '{"action": "FAILED_ACTION"}'}
+            )
+            return "FAILED_ACTION", last_error
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -444,42 +417,14 @@ class LLMAgent:
             step, latency_ms, raw_content,
         )
 
-        # Parse raw JSON string → Python dict → Pydantic Action.
-        # JSONDecodeError and ValidationError are intentionally allowed
-        # to propagate — the caller's retry loop handles them.
-        payload = json.loads(raw_content)
-        action  = Action(**payload)
-
+        # Parse raw JSON string → Pydantic Action natively.
+        # Directive 5: Violent Validation.
+        try:
+            action = Action.model_validate_json(raw_content)
+        except ValidationError as e:
+            raise StructuralHallucinationError(str(e)) from e
+        
         return action, total_tokens, latency_ms
-
-    @staticmethod
-    def _safe_fallback_action(obs: Observation) -> Action:
-        """Return a zero-dispatch safe action covering all zones in obs.
-
-        This ensures the simulation loop never receives ``None`` and can
-        always advance to the next step, even if the LLM is completely
-        unreachable.
-
-        Args:
-            obs: Current observation (used to enumerate zone keys).
-
-        Returns:
-            An ``Action`` with zero fire/ambulance dispatches for every zone.
-        """
-        safe_allocations = {
-            zone_id: ZoneDispatch(
-                dispatch_fire=0,
-                dispatch_ambulance=0,
-                control_traffic=False,
-            )
-            for zone_id in obs.zones.keys()
-        }
-        logger.warning(
-            "Returning SAFE_ZERO action for %d zones: %s",
-            len(safe_allocations),
-            list(safe_allocations.keys()),
-        )
-        return Action(allocations=safe_allocations)
 
     def reset_history(self) -> None:
         """Reset rolling conversation history between episodes.
@@ -498,6 +443,12 @@ class LLMAgent:
 def _assess_situation(obs: Observation) -> Tuple[str, str, str]:
     """Assess the most critical zone and overall risk level for [THINK] output.
 
+    Directive 4 Compliance: Epistemic Lens active. Assessment is based purely
+    on physically observable data (fire level, patient severity, traffic state).
+    No internal counters (consecutive_failures, step number) are accessed here.
+    The strategy label is derived from observed severity distribution, not
+    from a hidden step clock.
+
     Args:
         obs: Current environment observation.
 
@@ -507,15 +458,23 @@ def _assess_situation(obs: Observation) -> Tuple[str, str, str]:
     zone_scores: List[Tuple[int, str]] = []
     for z_name, z_state in obs.zones.items():
         score = 0
+        # Score based solely on physically observable severity levels.
         if z_state.fire == FireLevel.CATASTROPHIC:
             score += 100
         elif z_state.fire == FireLevel.HIGH:
             score += 50
+        elif z_state.fire == FireLevel.MEDIUM:
+            score += 25
         if z_state.patient == PatientLevel.CRITICAL:
             score += 80
+        elif z_state.patient == PatientLevel.MODERATE:
+            score += 30
         if z_state.traffic == TrafficLevel.GRIDLOCK:
             score += 40
-        score += z_state.consecutive_failures * 15
+        elif z_state.traffic == TrafficLevel.HEAVY:
+            score += 15
+        # Directive 4: consecutive_failures intentionally NOT accessed —
+        # that counter is backend-private and not in the Observation schema.
         zone_scores.append((score, z_name))
 
     zone_scores.sort(reverse=True)
@@ -529,9 +488,15 @@ def _assess_situation(obs: Observation) -> Tuple[str, str, str]:
     else:
         risk = "Low"
 
-    if obs.step <= 3:
+    # Strategy derived from observed severity spread, NOT from a step counter.
+    # Directive 4: obs.step is NOT accessed — it is no longer in the Observation.
+    active_zones = sum(1 for _, z in obs.zones.items()
+                       if z.fire != FireLevel.NONE
+                       or z.patient not in (PatientLevel.NONE, PatientLevel.FATAL)
+                       or z.traffic == TrafficLevel.GRIDLOCK)
+    if top_score >= 80:
         strategy = "AggressiveContainment"
-    elif obs.step <= 8:
+    elif active_zones >= 2:
         strategy = "StabilizeAndHeal"
     else:
         strategy = "OptimizeResources"
@@ -557,7 +522,7 @@ def run_episode(agent: LLMAgent, task_id: int) -> None:
     agent.reset_history()
 
     env     = CrisisManagementEnv(task_id=task_id)
-    obs     = env.reset()
+    obs, _  = env.reset()
     metrics = MetricsTracker()
 
     log_start(task=str(task_id), env="adaptive-crisis-management", model=agent.model)
@@ -575,15 +540,22 @@ def run_episode(agent: LLMAgent, task_id: int) -> None:
         log_think(step=step_count, critical=critical, risk=risk, strategy=strategy)
 
         # ---- LLM action decision -------------------------------------------
-        action, step_error = agent.get_action(obs, step_count)
-
-        # Serialise action for structured logging (compact single-line JSON).
-        action_json_str = json.dumps(
-            action.model_dump(mode="json"), separators=(",", ":")
-        )
+        try:
+            action, step_error = agent.get_action(obs, step_count)
+            if action == "FAILED_ACTION":
+                action_json_str = '"FAILED_ACTION"'
+            else:
+                action_json_str = json.dumps(
+                    action.model_dump(mode="json"), separators=(",", ":")
+                )
+        except StructuralHallucinationError as e:
+            action = e
+            step_error = str(e)
+            action_json_str = '"FAILED_ACTION"'
 
         # ---- Environment step ----------------------------------------------
-        obs, reward, done, info = env.step(action)
+        obs, reward, terminated, truncated, info = env.step(action)
+        done = terminated or truncated
         rewards.append(float(reward))
         metrics.update(reward, action, obs, done)
 

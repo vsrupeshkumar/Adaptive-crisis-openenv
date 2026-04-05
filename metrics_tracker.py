@@ -13,10 +13,10 @@ class MetricsTracker:
         self.step_count += 1
         self.total_reward += reward
         
-        # Calculate failures
-        for z_name, z_state in observation.zones.items():
-            if z_state.consecutive_failures > 0:
-                self.cascading_failures += 1
+        # Directive 4: consecutive_failures is backend-private and not in ZoneState.
+        # Proxy: a negative reward step indicates an escalation event.
+        if reward < 0:
+            self.cascading_failures += 1
                 
         # Estimate efficiency
         total_resources = (observation.idle_resources.fire_units + observation.busy_resources.fire_units + 

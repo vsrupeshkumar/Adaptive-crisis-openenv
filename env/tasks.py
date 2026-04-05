@@ -64,30 +64,17 @@ class Task:
     name: str = "unnamed"
 
     def generate_initial_observation(self, rng: random.Random) -> Observation:
-        """Return the deterministic starting observation for this task.
+        raise NotImplementedError
 
-        Monolithic Entropy Lock
-        -----------------------
-        The caller (``CrisisManagementEnv.reset()``) owns the single seeded
-        ``random.Random`` instance that governs this entire episode.  It is
-        passed here directly so that all draws in this method advance the
-        **same** PRNG state, guaranteeing:
+    def get_max_steps(self) -> int:
+        """Return the episode step limit for this task difficulty.
 
-        1. Identical output for the same seed across all Python environments.
-        2. Zero global-state side-effects — concurrent instances cannot
-           interfere with each other.
-        3. A single, auditable random-draw sequence per episode.
-
-        Args:
-            rng: The environment instance's pre-seeded ``random.Random``
-                 object.  All random draws **must** use this object.
+        This value is consumed by ``CrisisManagementEnv`` as a private
+        backend attribute (``self._max_steps``) and is NEVER serialised
+        into the agent-facing ``Observation`` (Directive 4 compliance).
 
         Returns:
-            A freshly constructed ``Observation`` for the beginning of an
-            episode under this task.
-
-        Raises:
-            NotImplementedError: Must be overridden by concrete subclasses.
+            Integer step limit for this task.
         """
         raise NotImplementedError
 
@@ -175,10 +162,12 @@ class EasyTask(Task):
                 police=self._IDLE_POLICE,
             ),
             busy_resources=ResourcePool(fire_units=0, ambulances=0, police=0),
-            step=0,
-            max_steps=self._MAX_STEPS,
+            # Directive 4: step and max_steps omitted — private backend state only.
             task_level=TaskLevel.EASY,
         )
+
+    def get_max_steps(self) -> int:
+        return self._MAX_STEPS
 
 
 # ---------------------------------------------------------------------------
@@ -260,10 +249,12 @@ class MediumTask(Task):
                 police=self._IDLE_POLICE,
             ),
             busy_resources=ResourcePool(),
-            step=0,
-            max_steps=self._MAX_STEPS,
+            # Directive 4: step and max_steps omitted — private backend state only.
             task_level=TaskLevel.MEDIUM,
         )
+
+    def get_max_steps(self) -> int:
+        return self._MAX_STEPS
 
 
 # ---------------------------------------------------------------------------
@@ -345,10 +336,12 @@ class HardTask(Task):
                 police=self._IDLE_POLICE,
             ),
             busy_resources=ResourcePool(),
-            step=0,
-            max_steps=self._MAX_STEPS,
+            # Directive 4: step and max_steps omitted — private backend state only.
             task_level=TaskLevel.HARD,
         )
+
+    def get_max_steps(self) -> int:
+        return self._MAX_STEPS
 
 
 # ---------------------------------------------------------------------------

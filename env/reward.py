@@ -715,40 +715,43 @@ def calculate_step_reward(
     )
 
 
+# Directive 3 Compliance: Penalties are mathematically subtracted from the total reward.
+# Zero-floor clamps have been removed to prevent keyword stuffing and resource spamming.
 def calculate_nlp_bonus(message: str, current_state: Observation) -> float:
     """Evaluate the agent's public broadcast message against the current crisis state.
 
-    Anti-Cheating Enforced: Utilizes a Precision-Recall penalty model
-    (λ = 0.5) and Anti-Bloat bounds to mathematically neutralize
-    keyword-stuffing exploits.
+    Directive 3 Compliance: Ruthless Utility NLP Grader — no zero-floor clamping.
+    The bonus CAN be negative if the agent hallucinates keywords or spams words.
 
     **Precision-Recall Penalty Model** — Design Philosophy
     -------------------------------------------------------
     The legacy additive grader was vulnerable to keyword stuffing: an agent
     that outputs every possible hazard keyword guaranteed a perfect score
-    regardless of relevance.  This function replaces it with:
+    regardless of relevance.  This function uses:
 
-        R_nlp = max(0.0,
-                    Σ_{i ∈ Valid}   w_i · 𝟙_i
-                  - λ · Σ_{j ∈ Invalid} 𝟙_j)
+        Final_NLP_Bonus = (Keywords_Found × Weight)
+                        - (Hallucinated_Keywords × λ)
+                        - (Word_Count × γ)
 
     Where:
         Valid    = keywords that are ACTUALLY active in the current ZoneState.
         Invalid  = tracked keywords present in message but NOT active (false positives).
         w_i      = per-component weight (0.4 zone / 0.3 hazard / 0.3 action).
-        λ        = 0.5  (hallucination penalty per false-positive keyword hit).
+        λ        = 0.5  (hallucination penalty per false-positive keyword).
+        γ        = 0.01 (bloat penalty per word beyond the 50-word threshold).
 
-    Anti-Bloat Constraint
-    ---------------------
-    Messages exceeding 200 characters are treated as a keyword-stuffing attempt
-    or unhelpful verbosity.  An additional bloat_penalty of -0.5 is applied to
-    the computed score before the zero-floor clamp.
+    Anti-Bloat Constraint (Word-Count Based)
+    -----------------------------------------
+    Word count beyond 50 words is penalised at γ = 0.01 per excess word.
+    This creates a continuous negative gradient against verbosity / spamming,
+    replacing the legacy binary character-length clamp.
 
-    Zero-Floor Bound
-    ----------------
-    The final returned value is clamped to max(0.0, score) so the NLP
-    sub-reward cannot infinitely drag down the primary dispatch reward —
-    the worst outcome is simply forfeiting the bonus.
+    Zero-Floor Removal
+    ------------------
+    The zero-floor clamp ``max(0.0, score)`` has been REMOVED.  The NLP
+    sub-reward IS allowed to go negative if the agent hallucinates or spams.
+    This enforces mathematical precision — forfeiting the bonus is no longer
+    a safe fall-back for a poorly-calibrated agent.
 
     Scoring Matrix (max 1.0 points, before penalties)
     --------------------------------------------------
@@ -764,21 +767,22 @@ def calculate_nlp_bonus(message: str, current_state: Observation) -> float:
 
     Penalty Matrix
     --------------
-    +-----------------------------+--------+-----------------------------------------------+
-    | Penalty                     | Amount | Trigger                                       |
-    +=============================+========+===============================================+
-    | Hallucination (per keyword) |  -0.5  | Tracked keyword in message but NOT active     |
-    +-----------------------------+--------+-----------------------------------------------+
-    | Anti-Bloat                  |  -0.5  | Message length > 200 characters               |
-    +-----------------------------+--------+-----------------------------------------------+
+    +-----------------------------+-------------+-----------------------------------------------+
+    | Penalty                     | Amount      | Trigger                                       |
+    +=============================+=============+===============================================+
+    | Hallucination (per keyword) |  -λ = -0.5  | Tracked keyword in message but NOT active     |
+    +-----------------------------+-------------+-----------------------------------------------+
+    | Bloat (per excess word)     |  -γ = -0.01 | Each word beyond the 50-word threshold        |
+    +-----------------------------+-------------+-----------------------------------------------+
 
     Args:
         message:       The agent's public_broadcast_message string.
         current_state: The current Observation used to ground keyword checks.
 
     Returns:
-        A float in ``[0.0, 1.0]`` representing the graded broadcast quality.
-        Always non-negative (zero-floored).
+        A float representing the graded broadcast quality.  CAN BE NEGATIVE
+        if hallucination or bloat penalties outweigh positive components.
+        There is NO zero-floor clamp (Directive 3 compliance).
     """
     if not message:
         return 0.0
@@ -852,15 +856,19 @@ def calculate_nlp_bonus(message: str, current_state: Observation) -> float:
         return 0.0
 
     # =========================================================================
-    # ANTI-BLOAT CONSTRAINT: messages > 200 chars are penalised immediately.
+    # ANTI-BLOAT CONSTRAINT (Directive 3): word-count based, γ = 0.01 per
+    # excess word beyond the 50-word threshold.  Creates a continuous negative
+    # gradient against verbosity — replacing the legacy binary char-length clamp.
     # =========================================================================
-    _MAX_MESSAGE_LENGTH = 200
-    bloat_penalty: float = 0.0
-    if len(message) > _MAX_MESSAGE_LENGTH:
-        bloat_penalty = -0.5
+    _GAMMA: float = 0.01          # bloat penalty per excess word
+    _WORD_LIMIT: int = 50         # words allowed before bloat penalty kicks in
+    word_count: int = len(message.split())
+    excess_words: int = max(0, word_count - _WORD_LIMIT)
+    bloat_penalty: float = -_GAMMA * excess_words
+    if excess_words > 0:
         logger.warning(
-            "NLP Anti-Bloat: message length %d > %d → bloat_penalty=-0.5",
-            len(message), _MAX_MESSAGE_LENGTH,
+            "NLP Anti-Bloat (Directive 3): %d words, %d excess (limit=%d) → bloat_penalty=%.3f",
+            word_count, excess_words, _WORD_LIMIT, bloat_penalty,
         )
 
     # =========================================================================
@@ -891,6 +899,7 @@ def calculate_nlp_bonus(message: str, current_state: Observation) -> float:
 
     # =========================================================================
     # FALSE POSITIVE SCANNER (λ = 0.5 per hallucinated keyword).
+    # Directive 3: hallucination_penalty is subtracted with NO zero-floor.
     # =========================================================================
     _LAMBDA: float = 0.5
     hallucination_count: int = 0
@@ -906,18 +915,24 @@ def calculate_nlp_bonus(message: str, current_state: Observation) -> float:
     hallucination_penalty: float = _LAMBDA * hallucination_count
 
     # =========================================================================
-    # FINAL SCORE: apply penalties, then zero-floor.
+    # FINAL SCORE (Directive 3): NO zero-floor clamp.
+    #   Final_NLP_Bonus = (Keywords_Found × Weight)
+    #                   - (Hallucinated_Keywords × λ)
+    #                   - (Excess_Words × γ)
+    # The score IS allowed to be negative — forfeiting the bonus is NOT a
+    # safe strategy for an agent that hallucinates or keyword-stuffs.
     # =========================================================================
-    raw_score = nlp_score - hallucination_penalty + bloat_penalty
-    final_score = max(0.0, raw_score)
+    final_score: float = nlp_score - hallucination_penalty + bloat_penalty
+    # REMOVED: final_score = max(0.0, raw_score)  ← zero-floor clamp eliminated per Directive 3.
 
     logger.info(
-        "NLP Grader | critical_zone=%s is_fire=%s | "
-        "raw_pos=%.1f hallucinations=%d(×%.1f) bloat=%.1f | "
-        "raw=%.2f → final=%.2f | msg=%r",
+        "NLP Grader (Directive 3) | critical_zone=%s is_fire=%s | "
+        "keywords=%.1f hallucinations=%d(×λ=%.1f) words=%d(excess=%d,×γ=%.2f) | "
+        "final_nlp_bonus=%.4f | msg=%r",
         critical_zone_id, critical_is_fire,
-        nlp_score, hallucination_count, _LAMBDA, bloat_penalty,
-        raw_score, final_score,
+        nlp_score, hallucination_count, _LAMBDA,
+        word_count, excess_words, _GAMMA,
+        final_score,
         message[:60],
     )
     return final_score
