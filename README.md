@@ -1,6 +1,6 @@
 #  Adaptive Crisis Management: Meta AI Capstone Edition 
 
-An extraordinarily massive leap beyond basic RL frameworks. This environment simulates a hyper-realistic smart city orchestration grid tailored to definitively conquer the Meta AI Hackathon constraints while boasting immense technical depth.
+An extraordinarily massive leap beyond basic RL frameworks. This environment simulates a hyper-realistic smart city orchestration grid tailored to definitively conquer the Meta AI Hackathon constraints while boasting immense technical depth..
 
 ##  Physics Constraints & Capstone Mechanics
 
