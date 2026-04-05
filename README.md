@@ -1,3 +1,12 @@
+---
+title: Adaptive Crisis Env
+emoji: 🚨
+colorFrom: red
+colorTo: yellow
+sdk: docker
+pinned: false
+license: mit
+---
 # Adaptive Crisis Management Environment
 *A Mathematically Rigorous, Zero-Trust RL Meta PyTorch OpenEnv Hackathon Submission*
 
