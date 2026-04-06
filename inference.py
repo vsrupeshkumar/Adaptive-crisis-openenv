@@ -41,9 +41,14 @@ from typing import Any, Dict, List, Optional, Tuple
 from dotenv import load_dotenv
 
 # ---------------------------------------------------------------------------
-# Environment variable loading — must happen before any client instantiation
+# Global Configuration & Environment (No-Default Rule for Secrets)
 # ---------------------------------------------------------------------------
-load_dotenv()
+API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8080/v1")
+MODEL_NAME = os.getenv("MODEL_NAME", "llama-3.3-70b-versatile")
+HF_TOKEN = os.getenv("HF_TOKEN")
+
+# Optional - if you use from_docker_image():
+LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME")
 
 ENV_URL = os.getenv("ENV_URL", "http://localhost:7860")
 
@@ -53,6 +58,12 @@ ENV_URL = os.getenv("ENV_URL", "http://localhost:7860")
 import requests
 from openai import OpenAI, APIConnectionError, APIStatusError, APITimeoutError
 from pydantic import ValidationError
+
+# ---------------------------------------------------------------------------
+# Strict OpenAI Client Configuration
+# ---------------------------------------------------------------------------
+client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
+
 
 # ---------------------------------------------------------------------------
 # Internal imports
@@ -226,30 +237,21 @@ class LLMAgent:
     """
 
     def __init__(self) -> None:
-        api_base   = os.getenv("API_BASE_URL")
-        api_key    = os.getenv("HF_TOKEN")
-        self.model = os.getenv("MODEL_NAME", "llama-3.3-70b-versatile")
-
-        if not api_base:
+        if not API_BASE_URL:
             logger.warning(
                 "API_BASE_URL is not set. Falling back to OpenAI default endpoint. "
                 "Set API_BASE_URL in .env for custom inference servers."
             )
-        if not api_key:
+        if not HF_TOKEN:
             logger.error(
                 "HF_TOKEN is not set. API calls will fail with 401 Unauthorized. "
                 "Provide HF_TOKEN in .env or as an environment variable."
             )
 
-        self.client = OpenAI(
-            base_url=api_base,
-            api_key=api_key or "missing-token",   # client requires non-empty; will 401
-        )
-
         logger.info(
             "LLMAgent initialised | model=%s endpoint=%s",
-            self.model,
-            api_base or "<OpenAI default>",
+            MODEL_NAME,
+            API_BASE_URL or "<OpenAI default>",
         )
 
         # Conversation history: system message is always first.
@@ -359,13 +361,13 @@ class LLMAgent:
         """
         logger.debug(
             "Step %d | attempt %d — calling %s @ %s",
-            step, attempt, self.model, self.client.base_url,
+            step, attempt, MODEL_NAME, client.base_url,
         )
 
         t0 = time.monotonic()
 
-        response = self.client.chat.completions.create(
-            model=self.model,
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
             messages=self._history,                        # type: ignore[arg-type]
             response_format={"type": "json_object"},       # guaranteed JSON output
             temperature=0.2,                               # low temp for determinism
@@ -564,28 +566,17 @@ def run_episode(agent: LLMAgent, task_id: int) -> None:
     )
 
     # -------------------------------------------------------------------------
-    # Bulletproof I/O teardown — OpenEnv evaluator compliance
+    # Clean sys.stdout for Meta Grader Compliance
     # -------------------------------------------------------------------------
-    # All lines below write EXCLUSIVELY to sys.stdout (never logging/stderr) so
-    # that the Docker-level stdout capture and the bot's regex/JSON parsers see
-    # a clean, ordered stream.
-    #
-    # Rules enforced:
-    #   1. flush=True on every print → defeats Docker block-buffering.
-    #   2. file=sys.stdout explicitly → eliminates any chance of logging
-    #      formatters interleaving with the evaluator-facing output.
-    #   3. total_reward formatted to exactly 4 decimal places → prevents
-    #      scientific notation (e.g. 1.23e+02) that breaks float parsers.
-    #   4. obs.model_dump_json() printed on its own line with NO prefix text
-    #      → bot can call json.loads() on that single line without slicing.
+    # Only keep [START], [STEP], and [END] markers on stdout.
+    # Summary telemetry belongs in logger.info (stderr).
     # -------------------------------------------------------------------------
     total_reward: float = sum(rewards)
     formatted_reward: str = "{:.4f}".format(total_reward)
 
-    print("=== EVALUATION COMPLETE ===", file=sys.stdout, flush=True)
-    print(f"Total Reward: {formatted_reward}", file=sys.stdout, flush=True)
-    print("Final State:", file=sys.stdout, flush=True)
-    print(obs.model_dump_json(indent=2), file=sys.stdout, flush=True)
+    logger.info("=== EVALUATION COMPLETE ===")
+    logger.info("Total Reward: %s", formatted_reward)
+    logger.info("Final State: \n%s", obs.model_dump_json(indent=2))
 
 
 # ===========================================================================
