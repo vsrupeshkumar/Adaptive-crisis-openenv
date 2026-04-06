@@ -33,3 +33,6 @@ _ui_archive/**/.vercel/
 docker-compose.override.yml
 *.tar
 .DS_Store
+*.lockb
+node_modules/
+.env

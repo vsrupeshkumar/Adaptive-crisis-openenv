@@ -108,7 +108,16 @@ git push github main || git push github master
 echo "Deploying to Hugging Face [Evaluation Execution Tier]..."
 if [ -z "$HF_TOKEN" ]; then
     echo "⚠️  WARNING: HF_TOKEN is not set in the environment. Attempting unauthenticated / cached push. If this fails, export HF_TOKEN and rerun."
+    git push huggingface main || git push huggingface master
+else
+    # Clean the token of any hidden whitespace or newlines
+    CLEAN_TOKEN=$(echo "$HF_TOKEN" | tr -d '\n' | tr -d ' ')
+
+    # Construct the authenticated remote URL
+    REMOTE_URL="https://Anbu-00001:${CLEAN_TOKEN}@huggingface.co/spaces/Anbu-00001/adaptive-crisis-env"
+
+    # Execute the push
+    git push "$REMOTE_URL" main --force
 fi
-git push huggingface main || git push huggingface master
 
 echo "✅ [DEVOPS] Master Sync Completed. The Adaptive Crisis Environment is deployed."
