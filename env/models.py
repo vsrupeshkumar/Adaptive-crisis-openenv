@@ -190,6 +190,7 @@ class ActiveDeployment(BaseModel):
         ambulances:      Ambulance units in this deployment.
         police:          Police units in this deployment.
         steps_remaining: Ticks until units return to the idle pool.
+        status:          Strict state string: 'DISPATCHED', 'BUSY', or 'IDLE'.
     """
 
     zone_id: str
@@ -197,6 +198,7 @@ class ActiveDeployment(BaseModel):
     ambulances: int = Field(default=0, ge=0)
     police: int = Field(default=0, ge=0)
     steps_remaining: int = Field(default=1, ge=1)
+    status: str = Field(default="DISPATCHED")
 
 
 class ZoneState(BaseModel):

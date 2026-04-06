@@ -116,10 +116,12 @@ class _LifecycleManager:
         for dep in active_deployments:
             dep.steps_remaining -= 1
             if dep.steps_remaining <= 0:
+                dep.status = "IDLE"
                 rec_fire += dep.fire_units
                 rec_amb += dep.ambulances
                 rec_pol += dep.police
             else:
+                dep.status = "BUSY"
                 still_active.append(dep)
 
         if rec_fire or rec_amb or rec_pol:
@@ -320,12 +322,17 @@ class CrisisManagementEnv(Environment[Action, Observation, EnvironmentState]):
         # Directive 2 & 5: Structural Darwinism & Schema Brutality
         # =====================================================================
         if isinstance(action, StructuralHallucinationError):
-            self._is_done = True
             reward = -20.0
             self._total_reward += reward
             self._step_count += 1
+            
+            done = self._step_count >= self._max_steps
+            if done:
+                self._is_done = True
+                self._truncated = True
+
             logger.error(
-                "[Step %d] Directive 5 Schema Brutality: Bouncer caught hallucination! Terminal penalty.",
+                "[Step %d] Directive 5 Schema Brutality: Bouncer caught hallucination! Continuous penalty applied.",
                 self._step_count
             )
             
@@ -339,12 +346,17 @@ class CrisisManagementEnv(Environment[Action, Observation, EnvironmentState]):
             return self.obs.model_copy(deep=True), float(reward), self._terminated, self._truncated, info
 
         if not isinstance(action, Action):
-            self._is_done = True
             reward = -20.0
             self._total_reward += reward
             self._step_count += 1
+            
+            done = self._step_count >= self._max_steps
+            if done:
+                self._is_done = True
+                self._truncated = True
+
             logger.error(
-                "[Step %d] Structural Darwinism: Action is not a valid Pydantic Action! Terminal penalty.",
+                "[Step %d] Structural Darwinism: Action is not a valid Pydantic Action! Continuous penalty applied.",
                 self._step_count
             )
             
@@ -441,11 +453,16 @@ class CrisisManagementEnv(Environment[Action, Observation, EnvironmentState]):
             breach_penalty: float = -15.0 * severity_multiplier
 
             self._total_reward += breach_penalty
-            self._is_done = True  # Episode terminates immediately — no second chances.
+            
+            # Dynamically calculate the absolute step boundary
+            done = self._step_count >= self._max_steps
+            if done:
+                self._is_done = True
+                self._truncated = True
 
             logger.error(
-                "[Step %d] INVENTORY BREACH terminal penalty: %.1f (severity_mult=%.1f). "
-                "Episode terminated.",
+                "[Step %d] INVENTORY BREACH continuous penalty: %.1f (severity_mult=%.1f). "
+                "Episode continues to allow Agent Recovery.",
                 self._step_count, breach_penalty, severity_multiplier,
             )
 
@@ -458,7 +475,7 @@ class CrisisManagementEnv(Environment[Action, Observation, EnvironmentState]):
                 dispatch_quality=breach_penalty,
                 trajectory_shaping=0.0,
                 nlp_bonus=0.0,
-                is_terminal=True,
+                is_terminal=self._is_done,
             )
             logger.info(
                 "[Step %d] Reward Ledger (BREACH): %s",
@@ -479,7 +496,8 @@ class CrisisManagementEnv(Environment[Action, Observation, EnvironmentState]):
             return (
                 self.obs.model_copy(deep=True),
                 breach_penalty,
-                True,
+                self._terminated,
+                self._truncated,
                 {
                     "resolved": self._resolved_incidents,
                     "total": self._total_incidents,
@@ -845,6 +863,12 @@ class CrisisManagementEnv(Environment[Action, Observation, EnvironmentState]):
     ) -> Tuple[int, int, int]:
         """Deduct dispatched units from idle pool and track as a deployment.
 
+        MDP Physics (Dynamic Cooldown Calculus):
+        A baseline physical travel minimum of C >= 2 is enforced. This prevents 
+        a 0-turn resource replenishment loophole where deployed units instantly 
+        return to the idle pool on the agent's next turn. This strictly enforces
+        delayed gratification and resource conservation.
+
         Dispatch counts are clamped to the available idle pool; the agent
         cannot dispatch more resources than are currently idle.
 
@@ -873,14 +897,24 @@ class CrisisManagementEnv(Environment[Action, Observation, EnvironmentState]):
         self.obs.busy_resources.ambulances += used_amb
         self.obs.busy_resources.police     += used_pol
 
-        # Calculate cooldown duration (weather + gridlock prolong deployments).
-        cooldown = 1
-        if self.obs.weather == WeatherCondition.HURRICANE:
-            cooldown = 3
-        elif self.obs.weather == WeatherCondition.STORM:
-            cooldown = 2
-        if zone_state.traffic == TrafficLevel.GRIDLOCK:
-            cooldown += 2
+        # Implement the Dynamic Cooldown Calculus
+        import math
+        base_cooldown = 2
+
+        # Extract the incident's severity (e.g., 1 to 5)
+        fire_sev = {"none": 0, "low": 1, "medium": 2, "high": 3, "catastrophic": 4}.get(zone_state.fire.value, 0)
+        pat_sev = {"none": 0, "moderate": 1, "critical": 3, "fatal": 5}.get(zone_state.patient.value, 0)
+        traf_sev = {"low": 0, "heavy": 1, "gridlock": 2}.get(zone_state.traffic.value, 0)
+        severity = max(1, fire_sev, pat_sev, traf_sev)
+        
+        # Apply a weather multiplier
+        weather_multiplier = 1.0
+        if self.obs.weather == WeatherCondition.STORM:
+            weather_multiplier = 1.5
+        elif self.obs.weather == WeatherCondition.HURRICANE:
+            weather_multiplier = 2.0
+            
+        actual_cooldown = math.ceil((base_cooldown + severity) * weather_multiplier)
 
         if used_fire or used_amb or used_pol:
             self._active_deployments.append(
@@ -889,7 +923,8 @@ class CrisisManagementEnv(Environment[Action, Observation, EnvironmentState]):
                     fire_units=used_fire,
                     ambulances=used_amb,
                     police=used_pol,
-                    steps_remaining=cooldown,
+                    steps_remaining=actual_cooldown,
+                    status="DISPATCHED",
                 )
             )
             logger.debug(
@@ -898,7 +933,7 @@ class CrisisManagementEnv(Environment[Action, Observation, EnvironmentState]):
                 used_fire,
                 used_amb,
                 used_pol,
-                cooldown,
+                actual_cooldown,
             )
 
         return used_fire, used_amb, used_pol

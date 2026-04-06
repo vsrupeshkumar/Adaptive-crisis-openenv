@@ -1,6 +1,14 @@
 #!/bin/bash
 set -e
 
+if python3 pre_flight_check.py; then
+    echo "SCHEMA VERIFIED: Mathematical Constraints Passed."
+else
+    # The python script outputs the specific constraint violation
+    echo "Deployment aborted due to pre-flight check failure."
+    exit 1
+fi
+
 echo "🚨 [DEVOPS] Initializing Guillotine-Proof Sync Pipeline..."
 
 # ==============================================================================

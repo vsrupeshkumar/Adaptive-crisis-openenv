@@ -228,7 +228,7 @@ class LLMAgent:
     def __init__(self) -> None:
         api_base   = os.getenv("API_BASE_URL")
         api_key    = os.getenv("HF_TOKEN")
-        self.model = os.getenv("MODEL_NAME", "gpt-4-turbo")
+        self.model = os.getenv("MODEL_NAME", "llama-3.3-70b-versatile")
 
         if not api_base:
             logger.warning(

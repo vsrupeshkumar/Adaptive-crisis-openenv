@@ -22,6 +22,8 @@ load_dotenv()
 
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 
 from env import CrisisManagementEnv
 from env.models import Action, EnvironmentState, Observation, StructuralHallucinationError
@@ -59,6 +61,38 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    global _env
+    if _env is None:
+        return JSONResponse(
+            status_code=400,
+            content={"detail": "Environment not initialised. Call POST /reset first."}
+        )
+    
+    # Mathematical Penalty Calculus
+    _env._step_count += 1
+    reward = -20.0
+    done = _env._step_count >= _env._max_steps
+    
+    if done:
+        _env._is_done = True
+        
+    info = {
+        "error_type": "RequestValidationError",
+        "detail": "LLM generated an invalid JSON schema."
+    }
+    
+    # Force the 200 OK with the exact StepResponse schema
+    step_resp = StepResponse(
+        observation=_env.obs.model_dump(mode="json"),
+        reward=reward,
+        done=done,
+        info=info
+    )
+    
+    return JSONResponse(status_code=200, content=step_resp.model_dump())
 
 # ---------------------------------------------------------------------------
 # Global environment instance (one episode at a time, server-scoped)
@@ -169,21 +203,39 @@ async def step(request: Request) -> StepResponse:
         infrastructure_damage = 0.0
         time_penalty = 1.0
 
+        # -------------------------------------------------------------------------
+        # Dense Reward Gradients via State-Shift Deltas (S_{t-1} - S_t)
+        # -------------------------------------------------------------------------
+        # This replaces the binary reward logic with continuous gradient mapping.
+        # It calculates exact numerical deltas for medical and fire metrics,
+        # ensuring full compliance with OpenEnv learning mechanics.
+        # -------------------------------------------------------------------------
         sev_map = {
             "none": 0, 
             "low": 1, 
+            "moderate": 2, 
             "medium": 2, 
             "high": 3, 
-            "catastrophic": 4
+            "critical": 4, 
+            "catastrophic": 5,
+            "fatal": 5
         }
 
         for z_id, z_state in obs.zones.items():
             prev_z = prev_obs.zones.get(z_id)
-            if prev_z and prev_z.patient.value not in ("none", "fatal"):
-                if z_state.patient.value == "none":
-                    life_saved += 1.0
-            
-            infrastructure_damage += sev_map.get(z_state.fire.value, 0)
+            if prev_z:
+                # Dense Gradient Delta for Medical Stabilization
+                prev_pat = sev_map.get(prev_z.patient.value, 0)
+                curr_pat = sev_map.get(z_state.patient.value, 0)
+                life_saved += (prev_pat - curr_pat)
+
+                # Dense Gradient Delta for Fire Mitigation
+                prev_fire = sev_map.get(prev_z.fire.value, 0)
+                curr_fire = sev_map.get(z_state.fire.value, 0)
+                infrastructure_damage += (curr_fire - prev_fire)
+            else:
+                # Penalize newly uncovered dangers using their absolute severity baseline
+                infrastructure_damage += sev_map.get(z_state.fire.value, 0)
 
         multi_obj_reward = (w1 * life_saved) - (w2 * infrastructure_damage) - (w3 * time_penalty)
 
