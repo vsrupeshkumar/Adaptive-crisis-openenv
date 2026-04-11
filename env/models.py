@@ -465,6 +465,12 @@ class Action(BaseModel):
 # Environment State (full internal snapshot — superset of Observation)
 # ===========================================================================
 
+class TrajectoryStep(BaseModel):
+    """An atomic trajectory element for episode history reasoning."""
+    observation: Observation
+    action: Action
+    reward: float
+
 class EnvironmentState(BaseModel):
     """Complete internal snapshot of the environment.
 
@@ -490,6 +496,7 @@ class EnvironmentState(BaseModel):
     success: bool
     metrics: Dict[str, float] = Field(default_factory=dict)
     invalid_action_count: int = Field(default=0, ge=0)
+    episode_history: List[TrajectoryStep] = Field(default_factory=list, description="A sliding window of the last k steps (o_t, a_t, r_t).")
 
 
 # ===========================================================================

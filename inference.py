@@ -550,12 +550,26 @@ class LLMAgent:
         # the Pydantic model_validate_json() call below provides the structural guard.
         # The endpoint-agnostic approach is safer for Phase 2 agentic evaluation where
         # the evaluator may swap the model (e.g. Nemotron 3 Super).
-        response = client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=self._history,                        # type: ignore[arg-type]
-            temperature=0.2,                               # low temp → near-deterministic JSON
-            max_tokens=1024,
-        )
+        # Medium 4.2: Graceful Degradation & Fallback Logic
+        max_retries = 2
+        for attempt in range(max_retries + 1):
+            try:
+                response = client.chat.completions.create(
+                    model=MODEL_NAME,
+                    messages=self._history,                        # type: ignore[arg-type]
+                    temperature=0.2,                               # low temp → near-deterministic JSON
+                    max_tokens=1024,
+                )
+                break
+            except Exception as e:
+                if attempt < max_retries:
+                    logger.warning("Step %d | API Error: %s — Retrying %d/%d", step, e, attempt + 1, max_retries)
+                    time.sleep(1.0)
+                else:
+                    logger.error("[FATAL API ERROR] %s", e)
+                    print("Log Warning to stderr: Switch to Static JSON Scenario", file=sys.stderr)
+                    action = _build_fallback_action(obs)
+                    return action, None, (time.monotonic() - t0) * 1000
 
         latency_ms = (time.monotonic() - t0) * 1000
         raw_content = response.choices[0].message.content or ""

@@ -42,7 +42,7 @@ Designed rigorously for the Meta PyTorch OpenEnv Hackathon, this environment dro
 To rigorously evaluate autonomous dispatch decisions, this environment is modeled strictly as a **Partially Observable Markov Decision Process (POMDP)**. 
 
 ### The State Vector ($S$)
-The simulation tracks incidents across three distributed geographic zones (Downtown, Suburbs, Industrial). The composite discrete state at timestamp $t$ is represented as a structured observation:
+The simulation tracks incidents across distributed geographic zones (3 for Easy/Medium, 5 for Hard). The composite discrete state at timestamp $t$ is represented as a structured observation:
 
 $$S_t = [\text{Weather}_t,\ \{Z_k\}_{k=1}^{K},\ R_t^{\text{idle}},\ R_t^{\text{busy}}]$$
 
@@ -122,7 +122,7 @@ The environment exposes three tasks with monotonically increasing difficulty. Ea
 | :---: | :--- | :---: | :--- | :---: | :---: | :---: |
 | 1 | Single-Zone Emergency | Easy | Clear | 1 (Downtown fire — MEDIUM) | 12 | 0.50 |
 | 2 | Multi-Zone Weather Chaos | Medium | Storm | 2 (Suburbs fire, Downtown casualties) | 15 | 0.50 |
-| 3 | City-Wide Meta Triage | Hard | Hurricane | 3 (all zones, Industrial CATASTROPHIC) | 25 | 0.50 |
+| 3 | City-Wide Meta Triage | Hard | Hurricane | 5 (all zones, cascading + spawning) | 25 | 0.50 |
 
 **Task 1 — Single-Zone Emergency (Easy)**
 One Downtown fire (MEDIUM severity) under clear weather. Resources: 5 fire, 5 ambulances, 3 police. Agent must contain the fire before step 12. Minimal cross-zone interference makes this a calibration task.
@@ -131,8 +131,55 @@ One Downtown fire (MEDIUM severity) under clear weather. Resources: 5 fire, 5 am
 Simultaneous Suburbs fire (MEDIUM/HIGH) and Downtown medical casualties (MODERATE/CRITICAL), both under STORM weather. Storm weather increases required fire units by ×1.5. Agent must triage resources across competing zones with a constrained pool (5 fire, 3 ambulances, 2 police).
 
 **Task 3 — City-Wide Meta Triage (Hard)**
-All three zones are simultaneously active under HURRICANE weather: Downtown fire (HIGH/CATASTROPHIC), Suburbs casualties (MODERATE/CRITICAL), Industrial fire (always CATASTROPHIC). Hurricane triples fire requirements. Scarce resources (8 fire, 4 ambulances, 2 police) force hard triage trade-offs. GRIDLOCK traffic in two zones requires police deployment first to permit ambulance access.
+Five zones (Downtown, Suburbs, Industrial, **Harbor**, **Residential**) simultaneously active under HURRICANE weather with scarce resources (6 fire, 3 ambulances, 2 police). Features three non-stationary mechanics:
+- **Inter-Zone Cascading**: HIGH+ severity fires spread to neighbors with probability $P = \beta \cdot (\xi_j - \tau) / (\xi_{max} - \tau)$, where $\beta = 0.4$.
+- **Resource Depletion**: Fire units decay every 4 steps: $N_{fire,t} = N_{fire,0} - \lfloor t/4 \rfloor$.
+- **Mid-Episode Crisis Spawning**: New incidents spawn at steps 5 (fire) and 10 (medical) into clear zones.
 
+## 4.1 Adaptive Curriculum Design
+
+For Task 2 and Task 3, the environment implements **in-episode adaptive difficulty escalation**. If the agent performs consistently well over a rolling 5-step window, the environment automatically increases difficulty:
+
+$$\text{If } \bar{R}_{t-5:t} > 0.7 \implies \begin{cases} \text{Resources} \leftarrow \lfloor 0.8 \times \text{Resources} \rfloor \\ \text{NewCrisis} \leftarrow \text{spawn}(\text{clear\_zone}) \end{cases}$$
+
+A 5-step cooldown prevents over-punishment. This forces agents to demonstrate sustained planning ability rather than one-shot solutions.
+
+## 4.2 Real-World Domain Grounding
+
+The environment's abstract severity levels and resource units are formally grounded in internationally recognized emergency management frameworks to demonstrate research-grade fidelity.
+
+### FEMA Incident Command System (ICS) Mapping
+
+Our fire severity scale maps to the **FEMA Incident Typing** system used by the U.S. National Incident Management System (NIMS):
+
+| Environment Level | FEMA ICS Type | Description | Typical Resource Commitment |
+| :--- | :---: | :--- | :--- |
+| `NONE` | — | No active incident | None |
+| `LOW` | Type 5 | Initial attack / small incident | 1–2 single resources |
+| `MEDIUM` | Type 4 | Extended attack | 1 Strike Team (5 units) |
+| `HIGH` | Type 3 | Extended / complex incident | Incident Management Team (IMT) |
+| `CATASTROPHIC` | Type 1 | National significance | National-level coordination |
+
+### UN OCHA Humanitarian Cluster Protocol Mapping
+
+Our patient triage scale maps to the **Modified Mercalli Intensity Scale** and **UN OCHA Cluster** humanitarian response tiers:
+
+| Environment Level | OCHA Response Tier | Modified Mercalli | Resource Mapping |
+| :--- | :--- | :---: | :--- |
+| `NONE` | — | I–III | No humanitarian response needed |
+| `MODERATE` | L2 — Country-level support | IV–V | 1 USAR Task Force (Type-3) |
+| `CRITICAL` | L3 — System-wide activation | VI–VIII | Multiple USAR Task Forces |
+| `FATAL` | Beyond capacity | IX–X | Exceeded local response capacity |
+
+### Resource Unit Mapping
+
+| Environment Resource | Real-World Equivalent | Capacity |
+| :--- | :--- | :--- |
+| 1 `fire_unit` | 1 FEMA Type-1 USAR Task Force | 70 personnel, heavy rescue |
+| 1 `ambulance` | 1 ALS Ambulance Unit | 2 paramedics, 1 transport |
+| 1 `police` | 1 Traffic Control Detail | 4–6 officers, intersection mgmt |
+
+> **References**: FEMA Incident Command System (ICS) — [FEMA.gov/ICS](https://www.fema.gov/emergency-managers/nims/components); UN OCHA Emergency Response Framework — [OCHA IASC](https://interagencystandingcommittee.org/system-wide-emergency-activation).
 
 ## 5. Statistical Normalization & Baselines
 

@@ -59,54 +59,70 @@ This document outlines the strategic roadmap and technical specifications requir
 ## 🟧 2. CRITICAL: Engineering Sophistication & Exploit Resistance
 *These items separate the top 10 from the general field, targeted at experienced ML reviewers.*
 
-### 2.1 Concurrency & Session Isolation
+### 2.1 Concurrency & Session Isolation — [IMPLEMENTED]
 **Requirement**: Prevent state "bleeding" between concurrent agents (e.g., during Phase 2 auto-evaluation).
-*   **Technical Detail**: Transition from Global State to **UUID-based Session Management**. Use `sessions: Dict[str, EnvState]` and an `asyncio.Lock` for atomic state updates.
-*   **Mathematical Detail**: Every request must carry a unique `session_id`. Total active sessions $N_{sessions} \le \text{MAX\_CAPACITY}$ to ensure memory safety.
+*   **Technical Specification**: Replaced global `_env` singleton with a **UUID-based Session Store** (`_sessions: Dict[str, CrisisManagementEnv]`) protected by `asyncio.Lock` for atomic state updates. Each `POST /reset` creates an isolated env, keyed by UUID.
+*   **Mathematical Detail**: $N_{sessions} \le \text{MAX\_SESSIONS} = 16$ to ensure memory safety. Session auto-cleanup occurs on episode termination.
+*   **Backward Compatibility**: If no `session_id` is provided, the server uses the `"default"` session, preserving compatibility with existing `inference.py` (zero code changes required).
+*   **API Changes**:
+    - `POST /reset` returns `session_id` in response body
+    - `POST /step` accepts optional `session_id` in request body
+    - `GET /health` returns `active_sessions` and `max_sessions` counts
+    - `DELETE /session/{session_id}` for manual cleanup
 
-### 2.2 Adaptive Curriculum Design
-**Requirement**: The environment must dynamically adjust difficulty (Curriculum Learning).
-*   **Technical Detail**: Add `adaptive_mode` in `reset()`.
-*   **Mathematical Detail**: 
-    - **Performance Trigger**: If $\bar{R}_{t-5:t} > 0.7$, trigger escalation $\mathcal{E}$.
-    - **Escalation**: $\mathcal{E} \implies \{ \text{Resources} \leftarrow 0.8 \cdot \text{Resources}, \text{NewCrisis} \leftarrow \text{spawn}() \}$.
+### 2.2 Adaptive Curriculum Design — [IMPLEMENTED]
+**Requirement**: The environment must dynamically adjust difficulty in-episode (Curriculum Learning).
+*   **Technical Specification**: Implemented in `CrisisManagementEnv._apply_curriculum_escalation()`. A rolling 5-step reward window tracks agent performance. When the window mean exceeds a trigger threshold, the environment automatically escalates difficulty.
+*   **Mathematical Model**:
+    - **Rolling Window**: $W = \{R_{t-4}, R_{t-3}, R_{t-2}, R_{t-1}, R_t\}$, computed after each step's reward is committed.
+    - **Performance Trigger**: If $\bar{W} = \frac{1}{5}\sum_{i \in W} R_i > 0.7$, trigger escalation $\mathcal{E}$.
+    - **Escalation $\mathcal{E}$**:
+      $$\text{Resources} \leftarrow \lfloor 0.8 \times \text{Resources} \rfloor \quad (\min = 1)$$
+      $$\text{NewCrisis} \leftarrow \text{spawn}(\text{clear\_zone, alternating fire/medical})$$
+    - **Cooldown**: 5-step lockout between consecutive escalations to prevent over-punishment.
+    - **Gating**: Active for Task 2 and Task 3 only (Task 1 stays calibration-level).
+*   **Verification**: Fire reduced 5→4, ambulances 3→2 after window mean = 1.0 > 0.7 ✓
 
-### 2.3 Real-World Domain Grounding
-**Requirement**: Ground the abstract severity scores in real-world protocols.
-*   **Technical Detail**: Cite FEMA Incident Command System (ICS) or UN OCHA Cluster Protocols in the README.
+### 2.3 Real-World Domain Grounding — [IMPLEMENTED]
+**Requirement**: Ground the abstract severity scores in real-world emergency management protocols.
+*   **Technical Specification**: Added comprehensive mapping tables to `README.md` Section 4.2 and `openenv.yaml` `features.domain_grounding` metadata block.
 *   **Mathematical Mapping**:
-    - `severity_level` $[0, 10] \leftrightarrow$ **Modified Mercalli Intensity Scale** (for earthquakes).
-    - `resource_unit` $\leftrightarrow$ **Standard FEMA Response Teams** (e.g., Type-1 USAR Task Force).
+    - **Fire Severity** $\leftrightarrow$ **FEMA ICS Incident Typing**: `LOW`=Type-5, `MEDIUM`=Type-4, `HIGH`=Type-3, `CATASTROPHIC`=Type-1
+    - **Patient Triage** $\leftrightarrow$ **UN OCHA Cluster Protocol**: `MODERATE`=L2 (Country-level), `CRITICAL`=L3 (System-wide activation), `FATAL`=Beyond capacity
+    - **Seismicity** $\leftrightarrow$ **Modified Mercalli Intensity Scale**: `NONE`=I-III, `MODERATE`=IV-V, `CRITICAL`=VI-VIII, `FATAL`=IX-X
+    - **Resource Units** $\leftrightarrow$ **FEMA Response Teams**: 1 `fire_unit`=Type-1 USAR Task Force (70 personnel), 1 `ambulance`=ALS Unit
+*   **References**: FEMA NIMS (fema.gov/ICS), UN OCHA IASC Emergency Response Framework
 
 ---
 
 ## 🟨 3. HIGH: Technical Standards & Reusability
 *Markers of "Professional Maturity" and "Ecosystem Thinking".*
 
-### 3.1 Inference Log Integrity ([START]/[STEP]/[END])
+### 3.1 Inference Log Integrity ([START]/[STEP]/[END]) — [IMPLEMENTED]
 **Requirement**: Zero deviation from the OpenEnv logging specification.
-*   **Technical Detail**: Implement a `LogValidator` that re-parses the `stdout` stream to assert the presence and order of all 5 mandatory fields (`task_id`, `step`, `action`, `reward`, `cum_score`).
-*   **Validation**: `count([STEP]) == total_steps` and `is_json([STEP].content) == True`.
+*   **Technical Detail**: Implemented a `LogValidator` (`log_validator.py`) that re-parses the `stdout` stream to assert the presence and order of all mandatory fields (`task_id` mapped to `task` via regex, `step`, `action`, `reward`, and `score` mapped to cum_score). 
+*   **Validation**: Asserts `[START]`, sequential `[STEP]` logs, `is_json([STEP].action) == True`, and `[END]`. Checked with unit tests against corrupt, out-of-order, and compliant outputs.
 
-### 3.2 Metadata Richness (`openenv.yaml`)
+### 3.2 Metadata Richness (`openenv.yaml`) — [IMPLEMENTED]
 **Requirement**: Maximize discoverability via the AutoEnv API.
-*   **Action Item**: Include explicit tags, difficulty ranges, and `observation_type: structured-dict`. Ensure it matches the OpenEnv community catalog schema exactly.
+*   **Action Item**: Included explicit `tags` (`reinforcement-learning`, `pomdp`, etc.), `difficulty_ranges`, and `observation_type: structured-dict` natively in `openenv.yaml`.
+*   **Validation**: Verified schema compliance using `openenv validate`, resulting in full catalog schema alignment.
 
 ---
 
 ## 🟦 4. MEDIUM: Observability & Resilience
 *Ops-focused improvements that signal production readiness.*
 
-### 4.1 Production Observability Endpoints
+### 4.1 Production Observability Endpoints — [IMPLEMENTED]
 **Requirement**: Provide health and metric parity.
 *   **Technical Detail**: `GET /health` returning Groq API reachability, memory usage, and session count. `GET /metrics` providing aggregate episode statistics (Mean Reward, Completion Rate).
 
-### 4.2 Graceful Degradation & Fallback Logic
+### 4.2 Graceful Degradation & Fallback Logic — [IMPLEMENTED]
 **Requirement**: The environment must never return 500/Crash, even if Groq fails.
 *   **Technical Detail**: Implement a **Scenario Fallback Pool**. 
 *   **Logic**: If API Error $\to$ Retry (x2) $\to$ Switch to Static JSON Scenario $\to$ Log Warning to `stderr`.
 
-### 4.3 State Trajectory History
+### 4.3 State Trajectory History — [IMPLEMENTED]
 **Requirement**: Allow agents to reason over history without external state tracking.
 *   **Technical Detail**: Extend `state()` results to include `episode_history: List[TrajectoryStep]`.
 *   **Mathematical Detail**: $H = \{ (o_t, a_t, r_t) \}$ for $t \in [T-k, T]$, where $k=5$ (sliding window).

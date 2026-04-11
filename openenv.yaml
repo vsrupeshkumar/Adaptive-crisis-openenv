@@ -1,7 +1,7 @@
 spec_version: "1.0.0"
 env_id: "adaptive-crisis-env"
 entrypoint: "server/app.py"
-version: "4.0.0"
+version: "4.1.0"
 description: >
   An Enterprise-Grade, Multi-Zone POMDP for routing emergency response
   across distributed geographical clusters tracking weather and traffic latency.
@@ -9,7 +9,25 @@ description: >
 author: "Anbu-00001"
 license: "MIT"
 
+features:
+  session_isolation: true
+  adaptive_curriculum: true
+  domain_grounding:
+    fire_severity_mapping: "FEMA Incident Command System (ICS) Type 1-5"
+    patient_triage_mapping: "UN OCHA Cluster Protocol L2/L3"
+    seismicity_scale: "Modified Mercalli Intensity Scale (I-X)"
+    resource_units: "FEMA Type-1 USAR Task Force / ALS Ambulance Units"
+    references:
+      - "FEMA NIMS: https://www.fema.gov/emergency-managers/nims/components"
+      - "UN OCHA IASC: https://interagencystandingcommittee.org/system-wide-emergency-activation"
+
 metadata:
+  tags: [reinforcement-learning, crisis-management, resource-allocation, pomdp]
+  difficulty_ranges:
+    easy: "1 zone, clear weather (Task 1)"
+    medium: "2 zones, storm weather (Task 2)"
+    hard: "5 zones, hurricane weather, non-stationary mechanics (Task 3)"
+  observation_type: "structured-dict"
   engine: "HF Router (OpenAI-Compatible)"
   mathematical_standout:
     state_space:

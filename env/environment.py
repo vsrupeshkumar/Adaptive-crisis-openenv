@@ -40,6 +40,7 @@ from env.models import (
     WeatherCondition,
     ZoneDispatch,
     ZoneState,
+    TrajectoryStep,
     StructuralHallucinationError,
 )
 from env.reward import compute_reward, calculate_step_reward
@@ -212,6 +213,12 @@ class CrisisManagementEnv(Environment[Action, Observation, EnvironmentState]):
         self._is_hard_mode: bool = (task_id == 3)
         self._initial_fire_pool: int = 0  # original fire count for depletion tracking
 
+        # --- Adaptive Curriculum Design (Critical 2.2) ---
+        self._reward_window: List[float] = []      # rolling window of last 5 step rewards
+        self._curriculum_cooldown: int = 0          # steps remaining before next escalation
+        self._escalation_count: int = 0             # number of escalations applied
+        self._curriculum_enabled: bool = (task_id >= 2)  # active for Medium + Hard
+
         self.reset(seed=seed)
         logger.info("CrisisManagementEnv successfully booted locally against Task %d.", task_id)
 
@@ -289,6 +296,7 @@ class CrisisManagementEnv(Environment[Action, Observation, EnvironmentState]):
         self._total_incidents = self._count_incidents(self.obs)
         self._wasted_dispatches: float = 0.0  # Blocker #2: severity-weighted waste accumulator.
         self._prev_obs: Optional[Observation] = None  # Blocker #3: temporal shaping anchor.
+        self._trajectory_history: List[TrajectoryStep] = []  # Medium 4.3: Sliding window episode history
         # Enforce static horizon scaling directly from the exact Task definition schemas
         # to ensure 100% mathematical consistency with openenv.yaml (W-4 compliance)
         self._max_steps = self._task.get_max_steps()
@@ -309,6 +317,12 @@ class CrisisManagementEnv(Environment[Action, Observation, EnvironmentState]):
         # --- Hard-Mode State ---
         self._is_hard_mode = (self.task_id == 3)
         self._initial_fire_pool = self.obs.idle_resources.fire_units
+
+        # --- Adaptive Curriculum Reset ---
+        self._reward_window = []
+        self._curriculum_cooldown = 0
+        self._escalation_count = 0
+        self._curriculum_enabled = (self.task_id >= 2)
 
         logger.debug("Environment reset.  Total incidents: %d.", self._total_incidents)
         return self.obs.model_copy(deep=True), {}
@@ -655,6 +669,12 @@ class CrisisManagementEnv(Environment[Action, Observation, EnvironmentState]):
             self._apply_hard_mode_mechanics()
 
         # =====================================================================
+        # Adaptive Curriculum Escalation (Task 2 + 3)
+        # =====================================================================
+        if self._curriculum_enabled:
+            self._apply_curriculum_escalation()
+
+        # =====================================================================
         # Loop Detection & Action Diversity Tracking (Components 2 + 3)
         # =====================================================================
         action_hash = self._compute_action_hash(action)
@@ -812,6 +832,13 @@ class CrisisManagementEnv(Environment[Action, Observation, EnvironmentState]):
         # (use pre-rounded value so the accumulator remains precise).
         self._total_reward += reward
 
+        # --- Adaptive Curriculum: Feed reward into rolling window ---
+        self._reward_window.append(reward)
+        if len(self._reward_window) > 5:
+            self._reward_window = self._reward_window[-5:]
+        if self._curriculum_cooldown > 0:
+            self._curriculum_cooldown -= 1
+
         # 2. SANITIZATION LAYER: Round all floats to 4 decimal places for LLM
         #    token efficiency. Strips IEEE 754 artifacts from the JSON payload
         #    before Pydantic validation. math.isclose(abs_tol=1e-4) in the
@@ -911,6 +938,16 @@ class CrisisManagementEnv(Environment[Action, Observation, EnvironmentState]):
         # This strict ordering enables accurate Δ-severity calculations.
         self._prev_obs = prev_obs_snapshot
 
+        # Medium 4.3: State Trajectory History (sliding window k=5)
+        step_record = TrajectoryStep(
+            observation=prev_obs_snapshot,
+            action=action.model_copy(deep=True),
+            reward=reward
+        )
+        self._trajectory_history.append(step_record)
+        if len(self._trajectory_history) > 5:
+            self._trajectory_history = self._trajectory_history[-5:]
+
         return self.obs.model_copy(deep=True), float(reward), self._terminated, self._truncated, info
 
     @property
@@ -947,6 +984,8 @@ class CrisisManagementEnv(Environment[Action, Observation, EnvironmentState]):
             total_reward=self._total_reward,
             is_done=self._is_done,
             success=(self._resolved_incidents == self._total_incidents),
+            invalid_action_count=0,
+            episode_history=self._trajectory_history,
             metrics={
                 "efficiency": eff_score,
                 "lives_saved": float(self._lives_saved),
@@ -1348,3 +1387,83 @@ class CrisisManagementEnv(Environment[Action, Observation, EnvironmentState]):
             parts.append((zone_id, d.dispatch_fire, d.dispatch_ambulance, d.control_traffic))
         return hash(tuple(parts))
 
+    # ------------------------------------------------------------------
+    # Adaptive Curriculum Escalation (Critical 2.2)
+    # ------------------------------------------------------------------
+
+    def _apply_curriculum_escalation(self) -> None:
+        """Adaptive Curriculum Design — dynamically escalate difficulty.
+
+        Mathematical Model
+        ------------------
+        Performance Trigger:
+            If mean(R_{t-5:t}) > 0.7, trigger escalation ε.
+
+        Escalation ε:
+            Resources ← floor(0.8 × Resources)   (20% reduction)
+            NewCrisis ← spawn(clear_zone)          (fresh incident)
+
+        Cooldown:
+            After escalation, 5 steps must elapse before the next check.
+
+        Gating:
+            Only active for Task 2 and Task 3 (self._curriculum_enabled).
+            Uses self._rng for deterministic reproducibility.
+        """
+        if not self._curriculum_enabled:
+            return
+
+        # Need at least 5 data points in the window.
+        if len(self._reward_window) < 5:
+            return
+
+        # Respect cooldown.
+        if self._curriculum_cooldown > 0:
+            return
+
+        # Compute rolling mean of the last 5 step rewards.
+        window_mean = sum(self._reward_window) / len(self._reward_window)
+
+        # Performance trigger: mean > 0.7 → agent is doing too well, escalate.
+        _ESCALATION_THRESHOLD = 0.7
+        if window_mean <= _ESCALATION_THRESHOLD:
+            return
+
+        # --- ESCALATE: reduce resources by 20% ---
+        prev_fire = self.obs.idle_resources.fire_units
+        prev_amb = self.obs.idle_resources.ambulances
+
+        self.obs.idle_resources.fire_units = max(1, int(self.obs.idle_resources.fire_units * 0.8))
+        self.obs.idle_resources.ambulances = max(1, int(self.obs.idle_resources.ambulances * 0.8))
+
+        # --- ESCALATE: spawn a new crisis in a clear zone ---
+        clear_zones = [
+            z_id for z_id, z in self.obs.zones.items()
+            if z.fire == FireLevel.NONE
+            and z.patient in (PatientLevel.NONE, PatientLevel.FATAL)
+        ]
+        spawn_zone = None
+        if clear_zones:
+            spawn_zone = self._rng.choice(clear_zones)
+            target = self.obs.zones[spawn_zone]
+            # Alternate between fire and medical spawns.
+            if self._escalation_count % 2 == 0:
+                target.fire = FireLevel.MEDIUM
+            else:
+                target.patient = PatientLevel.MODERATE
+            self._total_incidents += 1
+
+        self._escalation_count += 1
+        self._curriculum_cooldown = 5  # 5-step cooldown
+
+        logger.warning(
+            "[Step %d] CURRICULUM ESCALATION #%d: "
+            "mean_reward=%.4f > threshold=%.2f | "
+            "fire: %d→%d, amb: %d→%d | "
+            "spawn_zone=%s",
+            self._step_count, self._escalation_count,
+            window_mean, _ESCALATION_THRESHOLD,
+            prev_fire, self.obs.idle_resources.fire_units,
+            prev_amb, self.obs.idle_resources.ambulances,
+            spawn_zone or "none (all zones active)",
+        )
