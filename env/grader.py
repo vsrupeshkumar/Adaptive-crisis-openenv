@@ -347,6 +347,7 @@ def grade_episode(
     total_steps: int,
     num_zones: int,
     wasted_dispatches: Optional[float] = None,
+    action_diversity: Optional[float] = None,
 ) -> float:
     """Deterministically grade a complete episode and return a score in [0.0, 1.0].
 
@@ -416,13 +417,30 @@ def grade_episode(
     # Final clamp ensures the output is STRICTLY in [0.0, 1.0].
     final_score = _clamp(raw_score)
 
+    # ---- Post-hoc Monotony Penalty ---------------------------------------- #
+    # If the agent's action diversity (unique_actions / total_actions) is below
+    # 0.3, multiply the final score by (action_diversity / 0.3).  This smoothly
+    # penalises cycling agents without altering the documented weight formula.
+    _DIVERSITY_THRESHOLD = 0.3
+    if action_diversity is not None and action_diversity < _DIVERSITY_THRESHOLD:
+        monotony_factor = action_diversity / _DIVERSITY_THRESHOLD
+        logger.warning(
+            "Monotony penalty: action_diversity=%.4f < threshold=%.2f → "
+            "score=%.4f × %.4f = %.4f",
+            action_diversity, _DIVERSITY_THRESHOLD,
+            final_score, monotony_factor, final_score * monotony_factor,
+        )
+        final_score = _clamp(final_score * monotony_factor)
+
     logger.info(
         "Grade: success_rate=%.4f(×%.1f) + efficiency=%.4f(×%.1f) + "
-        "resource_usage=%.4f(×%.1f) → raw=%.4f → score=%.4f",
+        "resource_usage=%.4f(×%.1f) → raw=%.4f → score=%.4f "
+        "(action_diversity=%s)",
         success_rate,  cfg.WEIGHT_SUCCESS_RATE,
         efficiency,    cfg.WEIGHT_EFFICIENCY,
         resource_usage, cfg.WEIGHT_RESOURCE_USE,
         raw_score, final_score,
+        f"{action_diversity:.4f}" if action_diversity is not None else "N/A",
     )
     return final_score
 
@@ -459,6 +477,7 @@ class Grader:
         total_steps: int = 1,
         num_zones: int = 3,
         wasted_dispatches: Optional[float] = None,
+        action_diversity: Optional[float] = None,
     ) -> Tuple[float, float]:
         """Compute a partial episode score and return ``(score, efficiency)``.
 
@@ -487,6 +506,7 @@ class Grader:
                 total_steps=total_steps,
                 num_zones=num_zones,
                 wasted_dispatches=wasted_dispatches,
+                action_diversity=action_diversity,
             )
             return final_score, efficiency
         except Exception as exc:

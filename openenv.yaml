@@ -120,6 +120,7 @@ reward:
     efficiency_bonus: "Bonus for rapid multi-zone containment"
     time_penalty: "Per-step cost when unresolved incidents remain active"
     multi_obj: "Multi-objective POMDP term combining Δ-severity trajectory shaping"
+    loop_penalty: "Penalty (δ=3.0) for repeating the same action within a 3-step sliding window"
 
 tasks:
   - name: "Single-Zone Emergency (Easy)"
@@ -134,7 +135,11 @@ tasks:
     max_steps: 15
   - name: "City-Wide Meta Triage (Hard)"
     difficulty: "hard"
-    description: "All zones active under hurricane conditions with scarce resources."
+    description: >
+      Five zones (Downtown, Suburbs, Industrial, Harbor, Residential) active under
+      hurricane conditions with scarce resources (6 fire / 3 ambulances).
+      Features inter-zone cascading severity, resource depletion every 4 steps,
+      and mid-episode disaster spawning at steps 5 and 10.
     success_threshold: 0.50
     max_steps: 25
 

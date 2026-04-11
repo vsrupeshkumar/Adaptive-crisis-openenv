@@ -43,7 +43,7 @@ from env.models import (
     StructuralHallucinationError,
 )
 from env.reward import compute_reward, calculate_step_reward
-from env.tasks import Task, create_task
+from env.tasks import Task, HardTask, create_task
 from openenv.core import Environment
 
 # ---------------------------------------------------------------------------
@@ -203,6 +203,15 @@ class CrisisManagementEnv(Environment[Action, Observation, EnvironmentState]):
         self.obs: Observation           # set by reset()
         self._prev_obs: Optional[Observation] = None  # Blocker #3: temporal shaping
 
+        # --- Loop Detection & Action Diversity (Component 2 + 3) ---
+        self._action_history: List[int] = []  # sliding window of action hashes
+        self._unique_actions: int = 0         # count of unique actions in episode
+        self._total_actions: int = 0          # total steps with valid actions
+
+        # --- Hard-Mode Mechanics (Component 1) ---
+        self._is_hard_mode: bool = (task_id == 3)
+        self._initial_fire_pool: int = 0  # original fire count for depletion tracking
+
         self.reset(seed=seed)
         logger.info("CrisisManagementEnv successfully booted locally against Task %d.", task_id)
 
@@ -290,6 +299,16 @@ class CrisisManagementEnv(Environment[Action, Observation, EnvironmentState]):
         self._zone_failures: Dict[str, int] = {
             z_id: 0 for z_id in self.obs.zones.keys()
         }
+
+        # --- Loop Detection & Action Diversity Reset ---
+        self._action_history = []
+        self._unique_actions_set: set = set()
+        self._unique_actions = 0
+        self._total_actions = 0
+
+        # --- Hard-Mode State ---
+        self._is_hard_mode = (self.task_id == 3)
+        self._initial_fire_pool = self.obs.idle_resources.fire_units
 
         logger.debug("Environment reset.  Total incidents: %d.", self._total_incidents)
         return self.obs.model_copy(deep=True), {}
@@ -492,6 +511,10 @@ class CrisisManagementEnv(Environment[Action, Observation, EnvironmentState]):
                 total_steps=max(self._step_count, 1),
                 num_zones=len(self.obs.zones),
                 wasted_dispatches=self._wasted_dispatches,
+                action_diversity=(
+                    float(self._unique_actions) / float(self._total_actions)
+                    if self._total_actions > 0 else 1.0
+                ),
             )
             self._prev_obs = prev_obs_snapshot
             return (
@@ -625,6 +648,29 @@ class CrisisManagementEnv(Environment[Action, Observation, EnvironmentState]):
                     amb_penalty_weight, amb_excess * amb_penalty_weight,
                 )
 
+        # =====================================================================
+        # Hard-Mode Mechanics (Task 3 only)
+        # =====================================================================
+        if self._is_hard_mode:
+            self._apply_hard_mode_mechanics()
+
+        # =====================================================================
+        # Loop Detection & Action Diversity Tracking (Components 2 + 3)
+        # =====================================================================
+        action_hash = self._compute_action_hash(action)
+        loop_penalty: float = 0.0
+        if action_hash in set(self._action_history[-3:]):
+            loop_penalty = 3.0  # δ = 3.0 heavy penalty for repeating
+            logger.warning(
+                "[Step %d] LOOP DETECTED: action hash %d repeats within last 3 steps → penalty -%.1f",
+                self._step_count, action_hash, loop_penalty,
+            )
+        self._action_history.append(action_hash)
+        if action_hash not in self._unique_actions_set:
+            self._unique_actions_set.add(action_hash)
+            self._unique_actions += 1
+        self._total_actions += 1
+
         # 4. Determine episode termination.
         all_clear = all(
             z.fire == FireLevel.NONE
@@ -738,6 +784,12 @@ class CrisisManagementEnv(Environment[Action, Observation, EnvironmentState]):
         discount = gamma ** max(0, self._step_count - 1)
         step_waste_penalty *= discount
 
+        # Absorb loop penalty into the waste category for ledger integrity.
+        # The reward identity requires: base + nlp - waste + eff - time + multi = total
+        # Since loop_penalty was already subtracted from `reward`, we record it in waste.
+        loop_penalty = round(loop_penalty, 4)
+        step_waste_penalty += loop_penalty
+
         # Pull Layer 3 components from the step_reward_ledger so the 6-component
         # Pydantic identity (verify_reward_ledger) holds in the final ledger too.
         step_efficiency_bonus: float = step_reward_ledger.efficiency_bonus
@@ -746,6 +798,7 @@ class CrisisManagementEnv(Environment[Action, Observation, EnvironmentState]):
 
         # 1. Synthesize the complete Multi-Objective Reward Tensor
         #    R_total = R_base + R_semantic - R_waste + R_efficiency - R_time + R_multiobj
+        #    NOTE: loop_penalty is already absorbed into step_waste_penalty above.
         reward: float = (
             base_dispatch_reward +
             step_nlp_bonus -
@@ -779,6 +832,12 @@ class CrisisManagementEnv(Environment[Action, Observation, EnvironmentState]):
             step_efficiency_bonus, step_time_penalty, step_multi_obj, reward,
         )
 
+        # --- Action Diversity metric for grader ---
+        action_diversity: float = (
+            float(self._unique_actions) / float(self._total_actions)
+            if self._total_actions > 0 else 1.0
+        )
+
         score, eff_score = Grader().get_score(
             incidents_resolved=self._resolved_incidents,
             total_incidents=self._total_incidents,
@@ -786,6 +845,7 @@ class CrisisManagementEnv(Environment[Action, Observation, EnvironmentState]):
             total_steps=max(self._step_count, 1),
             num_zones=len(self.obs.zones),
             wasted_dispatches=self._wasted_dispatches,
+            action_diversity=action_diversity,
         )
 
         # 3. Construct the strict Pydantic ledger — all 6 components populated.
@@ -819,6 +879,8 @@ class CrisisManagementEnv(Environment[Action, Observation, EnvironmentState]):
             else 1.0
         )
 
+
+
         info: Dict[str, Any] = {
             "resolved": self._resolved_incidents,
             "total": self._total_incidents,
@@ -828,6 +890,18 @@ class CrisisManagementEnv(Environment[Action, Observation, EnvironmentState]):
             "wasted_dispatches": self._wasted_dispatches,
             "step_waste_penalty": step_waste_penalty,   # per-step waste for evaluator transparency
             "reward_ledger": final_step_ledger.model_dump(),
+            "action_diversity": action_diversity,
+            # ---- Component 3: Top-level reward_breakdown for transparency ----
+            "reward_breakdown": {
+                "total": reward,
+                "base_dispatch": base_dispatch_reward,
+                "nlp_semantic": step_nlp_bonus,
+                "waste_penalty": -step_waste_penalty,
+                "efficiency_bonus": step_efficiency_bonus,
+                "time_penalty": -step_time_penalty,
+                "multi_objective": step_multi_obj,
+                "loop_penalty": -loop_penalty,
+            },
         }
 
         # Blocker #3: advance the temporal shaping anchor AFTER all mutations.
@@ -861,6 +935,10 @@ class CrisisManagementEnv(Environment[Action, Observation, EnvironmentState]):
             total_steps=max(self._step_count, 1),
             num_zones=len(self.obs.zones),
             wasted_dispatches=self._wasted_dispatches,
+            action_diversity=(
+                float(self._unique_actions) / float(self._total_actions)
+                if self._total_actions > 0 else 1.0
+            ),
         )
         return EnvironmentState(
             step_count=self._step_count,
@@ -1090,3 +1168,183 @@ class CrisisManagementEnv(Environment[Action, Observation, EnvironmentState]):
             zone_state.patient = _patient_escalation[zone_state.patient]
         if zone_state.traffic == TrafficLevel.HEAVY:
             zone_state.traffic = TrafficLevel.GRIDLOCK
+
+    # ------------------------------------------------------------------
+    # Hard-Mode Mechanics (Task 3 only)
+    # ------------------------------------------------------------------
+
+    def _apply_hard_mode_mechanics(self) -> None:
+        """Execute all Hard-mode mechanics in order.
+
+        These three mechanics are the key differentiator that prevents a greedy
+        argmax policy from scoring > 0.5 on Task 3:
+
+        1. Inter-zone cascading severity (fires spread to neighbors).
+        2. Resource depletion over time (fire units shrink every 4 steps).
+        3. Mid-episode disaster spawning (new crises at steps 5 and 10).
+
+        All mechanics use ``self._rng`` for deterministic reproducibility
+        under the Monolithic Entropy Lock contract.
+        """
+        self._hard_mode_cascading()
+        self._hard_mode_resource_depletion()
+        self._hard_mode_disaster_spawn()
+
+    def _hard_mode_cascading(self) -> None:
+        """Inter-Zone Cascading Severity — fires spread to neighboring zones.
+
+        Mathematical formula:
+            If zone A has severity ξ_A > τ (threshold = HIGH, ordinal 3),
+            each adjacent zone receives an escalation with probability:
+                P = β × (ξ_A − τ) / (ξ_max − τ)
+            where β = 0.4 (cascade probability coefficient).
+
+        Adjacency map is defined in HardTask.ADJACENCY (circular ring).
+        Uses self._rng for deterministic reproducibility.
+        """
+        if not isinstance(self._task, HardTask):
+            return
+
+        _FIRE_ORDINAL: Dict[FireLevel, int] = {
+            FireLevel.NONE: 0, FireLevel.LOW: 1, FireLevel.MEDIUM: 2,
+            FireLevel.HIGH: 3, FireLevel.CATASTROPHIC: 4,
+        }
+        _THRESHOLD = 3  # HIGH
+        _MAX_ORD = 4     # CATASTROPHIC
+        _BETA = 0.4      # cascade probability coefficient
+
+        adjacency = HardTask.ADJACENCY
+
+        # Snapshot severities BEFORE cascading to avoid chain reactions within step.
+        severity_snapshot: Dict[str, int] = {
+            z_id: _FIRE_ORDINAL.get(z.fire, 0)
+            for z_id, z in self.obs.zones.items()
+        }
+
+        for zone_id, severity_ord in severity_snapshot.items():
+            if severity_ord <= _THRESHOLD:
+                continue  # Only HIGH and CATASTROPHIC cascade.
+
+            neighbors = adjacency.get(zone_id, [])
+            cascade_prob = _BETA * (severity_ord - _THRESHOLD) / max(1, _MAX_ORD - _THRESHOLD)
+
+            for neighbor_id in neighbors:
+                if neighbor_id not in self.obs.zones:
+                    continue
+                neighbor_z = self.obs.zones[neighbor_id]
+                neighbor_sev = _FIRE_ORDINAL.get(neighbor_z.fire, 0)
+
+                # Only cascade upward — don't reduce severity.
+                if neighbor_sev >= severity_ord:
+                    continue
+
+                roll = self._rng.random()
+                if roll < cascade_prob:
+                    self._escalate_zone(neighbor_z)
+                    # Count new incidents if the zone was previously clear.
+                    if neighbor_sev == 0 and neighbor_z.fire != FireLevel.NONE:
+                        self._total_incidents += 1
+                    logger.warning(
+                        "[Step %d] CASCADING: %s (severity=%d) spread fire to %s "
+                        "(prob=%.2f, roll=%.4f)",
+                        self._step_count, zone_id, severity_ord,
+                        neighbor_id, cascade_prob, roll,
+                    )
+
+    def _hard_mode_resource_depletion(self) -> None:
+        """Resource Depletion Over Time — fire units decay every 4 steps.
+
+        Mathematical formula:
+            decay(t) = ⌊t / 4⌋ units removed from fire pool (cumulative check).
+            At step 4: lose 1 unit. At step 8: lose another. Etc.
+
+        Only fire units are depleted (ambulances remain constant).
+        Units are removed from idle pool; if idle < decay, remove what's available.
+        """
+        if self._step_count % 4 != 0 or self._step_count == 0:
+            return
+
+        # Lose 1 fire unit at each 4-step boundary.
+        units_to_lose = 1
+        actual_loss = min(units_to_lose, self.obs.idle_resources.fire_units)
+        if actual_loss > 0:
+            self.obs.idle_resources.fire_units -= actual_loss
+            logger.warning(
+                "[Step %d] RESOURCE DEPLETION: Lost %d fire unit(s). "
+                "Remaining idle fire: %d",
+                self._step_count, actual_loss,
+                self.obs.idle_resources.fire_units,
+            )
+
+    def _hard_mode_disaster_spawn(self) -> None:
+        """Mid-Episode Disaster Spawning — new crises at steps 5 and 10.
+
+        Mathematical formula:
+            If t ∈ {5, 10} and ∃ zone z : ξ_z = 0 (clear fire/patient):
+                ξ_z ← MEDIUM (fire) or MODERATE (patient)
+
+        Zone selection uses self._rng for deterministic reproducibility.
+        Spawns into currently-clear zones (fire==NONE and patient==NONE).
+        """
+        if self._step_count not in (5, 10):
+            return
+
+        # Find zones that are currently clear of both fire and medical incidents.
+        clear_zones = [
+            z_id for z_id, z in self.obs.zones.items()
+            if z.fire == FireLevel.NONE
+            and z.patient in (PatientLevel.NONE, PatientLevel.FATAL)
+        ]
+
+        if not clear_zones:
+            logger.info(
+                "[Step %d] DISASTER SPAWN: No clear zones available, skipping.",
+                self._step_count,
+            )
+            return
+
+        # Deterministically select a clear zone.
+        target_zone_id = self._rng.choice(clear_zones)
+        target_zone = self.obs.zones[target_zone_id]
+
+        # Alternate between fire and medical spawns.
+        if self._step_count == 5:
+            target_zone.fire = FireLevel.MEDIUM
+            self._total_incidents += 1
+            logger.warning(
+                "[Step %d] DISASTER SPAWN: New MEDIUM fire in %s!",
+                self._step_count, target_zone_id,
+            )
+        else:  # step 10
+            target_zone.patient = PatientLevel.MODERATE
+            self._total_incidents += 1
+            logger.warning(
+                "[Step %d] DISASTER SPAWN: New MODERATE medical emergency in %s!",
+                self._step_count, target_zone_id,
+            )
+
+    # ------------------------------------------------------------------
+    # Action Hash — Loop Detection Helper (Component 3)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _compute_action_hash(action: Action) -> int:
+        """Compute a deterministic hash of the agent's dispatch action.
+
+        Used by the loop detection system to identify repeated actions.
+        The hash captures the full allocation structure: which zones get
+        which resources.
+
+        Args:
+            action: The agent's Action for this step.
+
+        Returns:
+            Integer hash of the action's allocation structure.
+        """
+        # Build a hashable representation of the action.
+        parts: List[tuple] = []
+        for zone_id in sorted(action.allocations.keys()):
+            d = action.allocations[zone_id]
+            parts.append((zone_id, d.dispatch_fire, d.dispatch_ambulance, d.control_traffic))
+        return hash(tuple(parts))
+

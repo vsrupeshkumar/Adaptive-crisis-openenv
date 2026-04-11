@@ -799,7 +799,14 @@ def calculate_step_reward(
     efficiency_bonus       = round(efficiency_bonus, 4)
     time_penalty           = round(time_penalty, 4)
     multi_obj_reward       = round(multi_obj_reward, 4)
-    total_reward           = round(total_reward, 4)
+    # Recompute total from rounded sub-components to prevent IEEE 754 drift
+    # from exceeding the Pydantic model_validator's abs_tol=1e-4 threshold.
+    # With 5 zones the accumulated drift can exceed 1e-4 if total is rounded
+    # independently from its constituents.
+    total_reward = round(
+        base_dispatch_score + nlp_semantic_bonus_r - waste_penalty_r
+        + efficiency_bonus - time_penalty + multi_obj_reward, 4
+    )
 
     logger.info(
         "Step reward total=%.4f | dispatch_quality=%.4f trajectory_shaping=%.4f "

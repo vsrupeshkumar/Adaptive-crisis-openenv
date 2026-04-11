@@ -266,18 +266,39 @@ class HardTask(Task):
 
     Deterministic generation
     ------------------------
-    All three zones are seeded with randomised severities drawn from
-    pre-defined pools.  The Industrial fire is always CATASTROPHIC, but the
-    other zones use the RNG pool to introduce variety.
+    Five zones with staggered initial severities.  This task is designed so
+    that a greedy argmax policy (always send max to worst zone) cannot score
+    above 0.5 due to:
+
+    1. **Resource scarcity**: 6 fire / 3 ambulances across 5 zones.
+    2. **Staggered severity**: Not all zones start critical — some are LOW/MODERATE
+       and will escalate via inter-zone cascading if ignored.
+    3. **Non-stationarity**: Mid-episode disaster spawning and resource depletion
+       (implemented by environment.py's Hard-mode mechanics).
+
+    Adjacency map (circular for cascading):
+        Downtown ↔ Suburbs ↔ Industrial ↔ Harbor ↔ Residential ↔ Downtown
+
+    The adjacency map is consumed by ``CrisisManagementEnv`` for inter-zone
+    cascading severity (Task 3 only).
     """
 
     task_id = 3
     name = "City-Wide Meta Triage"
 
-    _IDLE_FIRE   = 8
-    _IDLE_AMB    = 4
+    _IDLE_FIRE   = 6   # Scarce: cannot resolve all 5 zones simultaneously.
+    _IDLE_AMB    = 3   # Scarce: forces triage sequencing.
     _IDLE_POLICE = 2
     _MAX_STEPS   = 25
+
+    # Circular adjacency map for inter-zone cascading (Task 3 mechanic).
+    ADJACENCY: dict = {
+        "Downtown":    ["Suburbs", "Residential"],
+        "Suburbs":     ["Downtown", "Industrial"],
+        "Industrial":  ["Suburbs", "Harbor"],
+        "Harbor":      ["Industrial", "Residential"],
+        "Residential": ["Harbor", "Downtown"],
+    }
 
     # Downtown fire options (seed-determined).
     _DT_FIRE_POOL = [FireLevel.HIGH, FireLevel.CATASTROPHIC]
@@ -286,6 +307,14 @@ class HardTask(Task):
     # Suburbs patient severity options.
     _SUB_PAT_POOL = [PatientLevel.CRITICAL, PatientLevel.MODERATE]
     _SUB_PAT_WTS  = [0.70, 0.30]
+
+    # Harbor fire options (seed-determined) — staggered LOW start.
+    _HARBOR_FIRE_POOL = [FireLevel.LOW, FireLevel.MEDIUM]
+    _HARBOR_FIRE_WTS  = [0.50, 0.50]
+
+    # Residential patient options (seed-determined) — staggered MODERATE start.
+    _RES_PAT_POOL = [PatientLevel.MODERATE, PatientLevel.NONE]
+    _RES_PAT_WTS  = [0.60, 0.40]
 
     def generate_initial_observation(self, rng: random.Random) -> Observation:
         """Generate the deterministic Task 3 starting state.
@@ -299,7 +328,7 @@ class HardTask(Task):
             rng: The environment's instance-bound seeded ``random.Random``.
 
         Returns:
-            Observation with city-wide multi-zone incidents under HURRICANE.
+            Observation with 5-zone city-wide incidents under HURRICANE.
         """
         downtown_fire: FireLevel = rng.choices(
             self._DT_FIRE_POOL, weights=self._DT_FIRE_WTS, k=1
@@ -307,6 +336,14 @@ class HardTask(Task):
 
         suburbs_patient: PatientLevel = rng.choices(
             self._SUB_PAT_POOL, weights=self._SUB_PAT_WTS, k=1
+        )[0]
+
+        harbor_fire: FireLevel = rng.choices(
+            self._HARBOR_FIRE_POOL, weights=self._HARBOR_FIRE_WTS, k=1
+        )[0]
+
+        residential_patient: PatientLevel = rng.choices(
+            self._RES_PAT_POOL, weights=self._RES_PAT_WTS, k=1
         )[0]
 
         zones = {
@@ -323,6 +360,16 @@ class HardTask(Task):
             "Industrial": ZoneState(
                 fire=FireLevel.CATASTROPHIC,  # Always catastrophic in Task 3.
                 patient=PatientLevel.NONE,
+                traffic=TrafficLevel.LOW,
+            ),
+            "Harbor": ZoneState(
+                fire=harbor_fire,             # Staggered: LOW or MEDIUM.
+                patient=PatientLevel.NONE,
+                traffic=TrafficLevel.HEAVY,
+            ),
+            "Residential": ZoneState(
+                fire=FireLevel.NONE,
+                patient=residential_patient,  # Staggered: MODERATE or NONE.
                 traffic=TrafficLevel.LOW,
             ),
         }
