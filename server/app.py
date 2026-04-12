@@ -404,6 +404,30 @@ async def delete_session(session_id: str) -> Dict[str, str]:
                 detail=f"Session '{session_id}' not found.",
             )
 
+# ---------------------------------------------------------------------------
+# TIER-2.2: Interactive Web Dashboard (Static File Mount)
+# ---------------------------------------------------------------------------
+# Serves the pure HTML/CSS/JS dashboard at /web without affecting any
+# existing API routes.  Uses Path(__file__) for CWD-independent resolution
+# and an existence guard to guarantee zero-risk graceful degradation.
+#
+# Route isolation proof:
+#   All @app.post/@app.get decorators are registered BEFORE this mount.
+#   FastAPI resolves decorated routes first → /reset, /step, /state, /health
+#   are ALWAYS matched before the static mount.  The mount only handles
+#   GET /web/* requests for HTML/CSS/JS files — zero overlap with the
+#   OpenEnv API.
+# ---------------------------------------------------------------------------
+from pathlib import Path
+from fastapi.staticfiles import StaticFiles
+
+_WEB_DIR = Path(__file__).parent / "web"
+if _WEB_DIR.exists():
+    app.mount("/web", StaticFiles(directory=str(_WEB_DIR), html=True), name="web")
+    logger.info("Web dashboard mounted at /web (dir=%s)", _WEB_DIR)
+else:
+    logger.info("Web dashboard directory not found at %s — skipping mount.", _WEB_DIR)
+
 def main():
     import uvicorn
     uvicorn.run("server.app:app", host="0.0.0.0", port=7860, log_level="info")

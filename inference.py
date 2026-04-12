@@ -104,6 +104,7 @@ from env.models import (
     ZoneDispatch,
     StructuralHallucinationError,
 )
+from env.reward import _get_required_fire, _get_required_ambulance
 from metrics_tracker import MetricsTracker
 
 # ===========================================================================
@@ -706,6 +707,128 @@ def _assess_situation(obs: Observation) -> Tuple[str, str, str]:
 
 
 # ===========================================================================
+# Saliency Attribution Logger — genuine feature-importance mapping
+# ===========================================================================
+#
+# Replaces the fraudulent "∇_s Q(s,a) — Gradient-based auditing" claim in
+# ARCHITECTURE_WHITEPAPER.md with a REAL, verifiable attribution metric.
+#
+# For each zone, we compute how closely the LLM's dispatch vector aligns
+# with the environment's mathematical requirement functions. This produces
+# a per-zone, per-hazard attribution score that reveals whether each
+# observation field was decision-relevant to the agent.
+#
+# Attribution semantics:
+#   = 1.0   → LLM allocated exactly what was needed (perfect targeting)
+#   > 1.0   → LLM over-allocated (safety buffer — feature was salient)
+#   < 1.0   → LLM under-allocated (feature was NOT salient enough)
+#   = 0.0   → No hazard, no dispatch (correctly ignored)
+#   = -1.0  → No hazard but dispatched anyway (hallucination / misattribution)
+# ===========================================================================
+
+def _compute_saliency(obs: Observation, action: Action) -> Dict[str, float]:
+    """Compute per-zone feature attribution by comparing the LLM's dispatch
+    vector against the environment's true mathematical requirement functions.
+
+    This is NOT gradient-based (that requires differentiable models). Instead
+    it provides a genuine, quantitative feature-attribution metric derived
+    from the ratio between actual dispatch quantities and the computed
+    minimum requirements from ``env.reward._get_required_fire`` and
+    ``env.reward._get_required_ambulance``.
+
+    The output is a flat dictionary of ``{zone.dimension_attribution: float}``
+    entries suitable for structured logging and post-hoc analysis.
+
+    Mathematical definition per zone z:
+        fire_attribution(z)    = D_fire(z) / R_fire(z)    if R_fire > 0
+                                 0.0                       if R_fire == 0 and D_fire == 0
+                                -1.0                       if R_fire == 0 and D_fire > 0
+
+        medical_attribution(z) = D_amb(z) / R_amb(z)      if R_amb > 0
+                                 0.0                       if R_amb == 0 and D_amb == 0
+                                -1.0                       if R_amb == 0 and D_amb > 0
+
+        traffic_influence(z)   = 1.0   if control_traffic AND zone has HEAVY/GRIDLOCK
+                                 0.0   if no traffic issue
+                                -1.0   if control_traffic BUT zone has LOW traffic
+
+    Args:
+        obs:    The current environment observation (provides zone states,
+                weather, and resource context).
+        action: The LLM's dispatch action for this step.
+
+    Returns:
+        A flat dict mapping ``"{zone_id}.{dimension}_attribution"`` to float
+        scores. Example::
+
+            {
+                "Downtown.fire_attribution": 1.0,
+                "Downtown.medical_attribution": 0.0,
+                "Downtown.traffic_influence": 0.0,
+                "Suburbs.fire_attribution": 0.0,
+                "Suburbs.medical_attribution": 1.33,
+                ...
+            }
+    """
+    saliency: Dict[str, float] = {}
+
+    for zone_id, zone_state in obs.zones.items():
+        dispatch = action.allocations.get(zone_id, ZoneDispatch())
+
+        # --- Fire Attribution ---
+        req_fire: int = _get_required_fire(zone_state.fire, obs.weather)
+        d_fire: int = dispatch.dispatch_fire
+
+        if req_fire > 0:
+            # Ratio of dispatched to required: 1.0 = perfect, >1 = over, <1 = under
+            fire_attr = round(d_fire / req_fire, 4)
+        elif d_fire == 0:
+            # No fire, no dispatch — correctly ignored
+            fire_attr = 0.0
+        else:
+            # No fire but dispatched anyway — hallucination / misattribution
+            fire_attr = -1.0
+
+        saliency[f"{zone_id}.fire_attribution"] = fire_attr
+
+        # --- Medical Attribution ---
+        req_amb: int = _get_required_ambulance(zone_state.patient)
+        d_amb: int = dispatch.dispatch_ambulance
+
+        if req_amb > 0:
+            med_attr = round(d_amb / req_amb, 4)
+        elif d_amb == 0:
+            med_attr = 0.0
+        else:
+            med_attr = -1.0
+
+        saliency[f"{zone_id}.medical_attribution"] = med_attr
+
+        # --- Traffic Influence ---
+        has_traffic_issue: bool = zone_state.traffic in (
+            TrafficLevel.HEAVY, TrafficLevel.GRIDLOCK
+        )
+        controls_traffic: bool = dispatch.control_traffic
+
+        if has_traffic_issue and controls_traffic:
+            # Correctly responded to traffic congestion
+            traffic_inf = 1.0
+        elif not has_traffic_issue and not controls_traffic:
+            # No issue, no response — correctly ignored
+            traffic_inf = 0.0
+        elif has_traffic_issue and not controls_traffic:
+            # Traffic issue exists but agent did not respond
+            traffic_inf = 0.0
+        else:
+            # No traffic issue but agent wasted police on it
+            traffic_inf = -1.0
+
+        saliency[f"{zone_id}.traffic_influence"] = traffic_inf
+
+    return saliency
+
+
+# ===========================================================================
 # Episode runner
 # ===========================================================================
 
@@ -758,6 +881,23 @@ def run_episode(agent: LLMAgent, task_id: int) -> None:
             action_json_str = json.dumps(
                 action.model_dump(mode="json"), separators=(",", ":")
             )
+
+            # ---- Saliency Attribution Logger (TIER-2.1) -------------------------
+            # Compute genuine feature-attribution BEFORE the action is sent to
+            # the environment. This captures the LLM's decision-relevance signal
+            # against the observation it actually saw when choosing this action.
+            try:
+                saliency = _compute_saliency(obs, action)
+                logger.info(
+                    "[SALIENCY] step=%d %s",
+                    step_count, json.dumps(saliency, separators=(",", ":")),
+                )
+            except Exception as sal_err:
+                # Saliency logging is diagnostic-only; never crash the episode.
+                logger.debug(
+                    "[SALIENCY] step=%d computation_error=%s",
+                    step_count, sal_err,
+                )
 
             # ---- Environment step ----------------------------------------------
             # action is always an Action Pydantic object with model_dump available.

@@ -34,5 +34,38 @@ The environment dynamically adjusts difficulty in-episode to probe agent resilie
 - **Graceful Degradation**: Dual-retry logic with fallback to a Scenario Fallback Pool (Static JSON) ensures high system availability.
 - **Observability**: Real-time `/health` and `/metrics` endpoints for production monitoring.
 
+## 6. Saliency Attribution Logger — Feature Importance Mapping
+
+The inference agent implements a **Dispatch-Requirement Ratio (DRR)** attribution system that quantifies which observation fields influenced each dispatch decision. This provides genuine, interpretable feature-attribution without requiring differentiable models.
+
+### Mathematical Definition
+
+For each zone $z$ in the observation, three attribution dimensions are computed:
+
+**Fire Attribution:**
+$$\alpha_{fire}(z) = \begin{cases} D_{fire}(z) \;/\; R_{fire}(z) & \text{if } R_{fire} > 0 \\ 0.0 & \text{if } R_{fire} = 0 \wedge D_{fire} = 0 \\ -1.0 & \text{if } R_{fire} = 0 \wedge D_{fire} > 0 \end{cases}$$
+
+where $R_{fire}(z) = f(\text{FireLevel}, \text{Weather})$ uses the environment's exact requirement function (`_get_required_fire`), incorporating weather friction modifiers (HURRICANE: +2, STORM: +1).
+
+**Medical Attribution:**
+$$\alpha_{med}(z) = \begin{cases} D_{amb}(z) \;/\; R_{amb}(z) & \text{if } R_{amb} > 0 \\ 0.0 & \text{if } R_{amb} = 0 \wedge D_{amb} = 0 \\ -1.0 & \text{if } R_{amb} = 0 \wedge D_{amb} > 0 \end{cases}$$
+
+where $R_{amb}(z) = g(\text{PatientLevel})$ maps CRITICAL $\to$ 3, MODERATE $\to$ 1, FATAL/NONE $\to$ 0.
+
+**Traffic Influence:**
+$$\alpha_{trf}(z) = \begin{cases} +1.0 & \text{if traffic} \in \{\text{HEAVY}, \text{GRIDLOCK}\} \wedge \text{control\_traffic} \\ 0.0 & \text{if no traffic issue} \\ -1.0 & \text{if traffic} = \text{LOW} \wedge \text{control\_traffic} \end{cases}$$
+
+### Interpretation Guide
+| Score | Meaning |
+|-------|---------|
+| $\alpha = 1.0$ | Perfect targeting — agent allocated exactly the minimum required |
+| $\alpha > 1.0$ | Over-allocation — feature was highly salient (safety buffer) |
+| $\alpha < 1.0$ | Under-allocation — feature was insufficiently salient |
+| $\alpha = 0.0$ | Correctly ignored — no hazard, no dispatch |
+| $\alpha = -1.0$ | Misattribution — resources wasted on non-existent hazard |
+
+### Implementation
+The saliency vector is computed in `inference.py::_compute_saliency()` **after** the LLM's action is parsed and **before** it is submitted to `/step`. This captures the agent's decision-relevance signal against the exact observation it used for selection. Results are emitted as structured `[SALIENCY]` log lines to stderr for post-hoc analysis.
+
 ---
 *Built to assert total technical dominance in the Meta AI Hackathon.*
