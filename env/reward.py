@@ -218,7 +218,12 @@ _PATIENT_RANK: Dict[PatientLevel, int] = {
 
 
 # ---------------------------------------------------------------------------
-# Pure helper: minimum resources required to resolve an incident
+# Public API: minimum resources required to resolve an incident
+#
+# These functions are the canonical resource-requirement calculators used by
+# both the reward module and the inference agent's saliency engine.
+# Public names: get_required_fire(), get_required_ambulance()
+# Private aliases (_-prefixed) retained for backward compatibility.
 # ---------------------------------------------------------------------------
 
 def _get_required_fire(level: FireLevel, weather: WeatherCondition) -> int:
@@ -273,6 +278,11 @@ def _get_required_fire(level: FireLevel, weather: WeatherCondition) -> int:
     return req
 
 
+# Public API alias — use this in external modules (inference.py, tests).
+# The underscore-prefixed name is retained for internal backward compatibility.
+get_required_fire = _get_required_fire
+
+
 def _get_required_ambulance(level: PatientLevel) -> int:
     """Return the minimum ambulances needed to resolve the given patient level.
 
@@ -299,6 +309,10 @@ def _get_required_ambulance(level: PatientLevel) -> int:
         return 1
     # FATAL: no ambulances can help; NONE: no medical incident.
     return 0
+
+
+# Public API alias — use this in external modules (inference.py, tests).
+get_required_ambulance = _get_required_ambulance
 
 
 # ---------------------------------------------------------------------------

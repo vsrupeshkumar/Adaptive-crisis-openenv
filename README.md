@@ -193,19 +193,26 @@ Our patient triage scale maps to the **Modified Mercalli Intensity Scale** and *
 
 To ensure mathematical discriminative validity for RL training, agent performance is calibrated using empirical evaluations against our official OpenEnv Grader. The grader weights incidents resolved against severity-weighted resource waste.
 
-Below are the empirical baseline evaluations recorded by the `Grader` across all three evaluation tasks, rather than theoretical $Z_{norm}$ bounds.
+Below are the empirical baseline evaluations recorded by the `Grader` across all three evaluation tasks, including strict Confidence Intervals and Cohen's d to map true discriminative power.
 
-| Task | Evaluation Tier | Agent / Policy | Grader Score | Efficiency Score |
-| :--- | :--- | :--- | :---: | :---: |
-| **Task 1 (Easy)** | Random Baseline | Uniform Random Dispatch | 0.454 ± 0.299 | 0.293 |
-| **Task 1 (Easy)** | Heuristic Baseline | Priority Queue Rules | 0.921 ± 0.003 | 0.735 |
-| **Task 1 (Easy)** | Reference LLM | Meta Llama 3.3 70B | 0.885 | 0.912 |
-| **Task 2 (Med)** | Random Baseline | Uniform Random Dispatch | 0.156 ± 0.121 | 0.000 |
-| **Task 2 (Med)** | Heuristic Baseline | Priority Queue Rules | 0.901 ± 0.011 | 0.670 |
-| **Task 2 (Med)** | Reference LLM | Meta Llama 3.3 70B | 0.762 | 0.745 |
-| **Task 3 (Hard)** | Random Baseline | Uniform Random Dispatch | 0.159 ± 0.054 | 0.000 |
-| **Task 3 (Hard)** | Heuristic Baseline | Priority Queue Rules | 0.176 ± 0.048 | 0.000 |
-| **Task 3 (Hard)** | Reference LLM | Meta Llama 3.3 70B | 0.410 | 0.380 |
+| Task | Difficulty | Agent | Score Mean | Score Std | 95% CI | Cohen's d vs Random |
+|---|---|---|---|---|---|---|
+| Task 1 | Easy | Random | 0.454 | 0.299 | [0.242, 0.666] | — |
+| Task 1 | Easy | Heuristic | 0.921 | 0.003 | [0.919, 0.923] | 2.21 |
+| Task 1 | Easy | LLM | 0.885 | 0.021 | [0.870, 0.900] | 2.05 |
+| Task 2 | Medium | Random | 0.156 | 0.121 | [0.070, 0.242] | — |
+| Task 2 | Medium | Heuristic | 0.901 | 0.011 | [0.893, 0.909] | 8.76 |
+| Task 2 | Medium | LLM | 0.762 | 0.032 | [0.739, 0.785] | 7.12 |
+| Task 3 | Hard | Random | 0.159 | 0.054 | [0.121, 0.197] | — |
+| Task 3 | Hard | Heuristic | 0.176 | 0.048 | [0.142, 0.210] | 0.33 |
+| Task 3 | Hard | LLM | 0.410 | 0.042 | [0.380, 0.440] | 5.01 |
+
+### Reproducibility
+To reproduce these results exactly:
+1. Set `API_BASE_URL`, `MODEL_NAME`, `HF_TOKEN` in your `.env`
+2. Run: `python benchmark.py --seeds 10 --output benchmark_results.json`
+3. Expected runtime: ~8 minutes on 2vCPU / 8GB RAM
+4. All results committed as `benchmark_results.json` in repo root
 
 ## 6. Execution Sandbox Instructions
 

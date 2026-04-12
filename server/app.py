@@ -430,6 +430,26 @@ async def delete_session(session_id: str) -> Dict[str, str]:
                 detail=f"Session '{session_id}' not found.",
             )
 
+@app.get("/trajectory", tags=["observability"])
+async def trajectory(session_id: Optional[str] = None):
+    """Retrieve the recent step-by-step trajectory history of a session.
+
+    Args:
+        session_id: Optional query parameter for session identification.
+    """
+    env = _get_session(session_id)
+    try:
+        # Pydantic v2 model_dump(mode="json") auto-serializes Enums, datetimes, etc.
+        history_json = [t.model_dump(mode="json") for t in env._trajectory_history]
+        return {
+            "history": history_json,
+            "step_count": env._step_count,
+            "total_reward": env._total_reward,
+        }
+    except Exception as exc:
+        logger.exception("Error during /trajectory: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
 # ---------------------------------------------------------------------------
 # TIER-2.2: Interactive Web Dashboard (Static File Mount)
 # ---------------------------------------------------------------------------

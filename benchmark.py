@@ -439,9 +439,22 @@ def run_benchmark(n_seeds: int = N_SEEDS, include_llm: bool = False) -> None:
 
     # Compute per-(agent, task) statistics
     import statistics
+    import math
+    import datetime
 
-    print(f"{'Agent':>12s} | {'Task':>35s} | {'Score (μ±σ)':>15s} | {'Efficiency (μ±σ)':>18s} | {'N':>3s}")
-    print(f"{'-'*12}-+-{'-'*35}-+-{'-'*15}-+-{'-'*18}-+-{'-'*3}")
+    print(f"{'Agent':>12s} | {'Task':>35s} | {'Score (μ±σ)':>15s} | {'95% CI':>15s} | {'Efficiency (μ±σ)':>18s} | {'N':>3s}")
+    print(f"{'-'*12}-+-{'-'*35}-+-{'-'*15}-+-{'-'*15}-+-{'-'*18}-+-{'-'*3}")
+
+    stats_map = {}
+    json_results = []
+    
+    # Pre-computed t-values for 95% Confidence Interval (alpha=0.05, two-tailed)
+    t_values_95 = {
+        1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 
+        6: 2.447, 7: 2.365, 8: 2.306, 9: 2.262, 10: 2.228,
+        11: 2.201, 12: 2.179, 13: 2.160, 14: 2.145, 15: 2.131,
+        16: 2.120, 17: 2.110, 18: 2.101, 19: 2.093, 20: 2.086
+    }
 
     for agent in agents:
         for task_id in TASKS:
@@ -455,46 +468,135 @@ def run_benchmark(n_seeds: int = N_SEEDS, include_llm: bool = False) -> None:
             scores = [r.score for r in task_results]
             efficiencies = [r.efficiency for r in task_results]
 
+            n = len(scores)
             mean_score = statistics.mean(scores)
-            std_score = statistics.stdev(scores) if len(scores) > 1 else 0.0
+            std_score = statistics.stdev(scores) if n > 1 else 0.0
             mean_eff = statistics.mean(efficiencies)
-            std_eff = statistics.stdev(efficiencies) if len(efficiencies) > 1 else 0.0
+            std_eff = statistics.stdev(efficiencies) if n > 1 else 0.0
+            
+            # Mathematical CI computation (t-distribution)
+            df = n - 1
+            t_crit = t_values_95.get(df, 1.96) # Default to normal approx for large N
+            ci_margin = t_crit * (std_score / math.sqrt(n)) if n > 0 else 0.0
+            ci_lower = max(0.0, mean_score - ci_margin)
+            ci_upper = min(1.0, mean_score + ci_margin)
+            
+            stats_map[(agent.name, task_id)] = {
+                "mean": mean_score, "std": std_score, "n": n, 
+                "ci_lower": ci_lower, "ci_upper": ci_upper,
+                "mean_eff": mean_eff
+            }
+
+            json_results.append({
+                "agent": agent.name,
+                "task": task_id,
+                "score_mean": round(mean_score, 4),
+                "score_std": round(std_score, 4),
+                "score_95_ci": [round(ci_lower, 4), round(ci_upper, 4)],
+                "efficiency_mean": round(mean_eff, 4),
+                "efficiency_std": round(std_eff, 4),
+                "n_episodes": n
+            })
 
             print(
                 f"{agent.name:>12s} | {TASK_NAMES[task_id]:>35s} | "
                 f"{mean_score:.3f} ± {std_score:.3f} | "
+                f"[{ci_lower:.3f}, {ci_upper:.3f}] | "
                 f"{mean_eff:.3f} ± {std_eff:.3f}    | "
-                f"{len(task_results):3d}"
+                f"{n:3d}"
             )
+
+    # ---------------------------------------------------------------------------
+    # Statistical Significance (Cohen's d)
+    # ---------------------------------------------------------------------------
+    print(f"\n{'='*80}", file=sys.stderr)
+    print(f" EFFECT SIZE & DISCRIMINATIVE POWER ANALYSIS", file=sys.stderr)
+    print(f"{'='*80}\n", file=sys.stderr)
+    
+    agent_separation = []
+    all_discriminative = True
+
+    for task_id in TASKS:
+        # Compare Random vs Heuristic
+        if ("Random", task_id) in stats_map and ("Heuristic", task_id) in stats_map:
+            r_stat = stats_map[("Random", task_id)]
+            h_stat = stats_map[("Heuristic", task_id)]
+            
+            p_var = (((r_stat["n"] - 1) * (r_stat["std"] ** 2)) + ((h_stat["n"] - 1) * (h_stat["std"] ** 2))) / (r_stat["n"] + h_stat["n"] - 2)
+            p_std = math.sqrt(p_var) if p_var > 0 else 0.0
+            cohens_d = abs(r_stat["mean"] - h_stat["mean"]) / p_std if p_std > 0 else 0.0
+            
+            is_discrim = cohens_d > 0.8  # Large effect size
+            all_discriminative = all_discriminative and is_discrim
+            
+            agent_separation.append({
+                "task_id": task_id,
+                "comparison": "Random vs Heuristic",
+                "cohens_d": round(cohens_d, 4),
+                "is_discriminative": is_discrim
+            })
+            
+            verdict = "✅ SEPARATED" if is_discrim else "⚠️ WEAK SEPARATION"
+            print(f"Task {task_id}: Random vs Heuristic -> Cohen's d = {cohens_d:.2f} ({verdict})", file=sys.stderr)
+
+        # Compare Heuristic vs LLM (if LLM is run)
+        if ("Heuristic", task_id) in stats_map and ("LLM", task_id) in stats_map:
+            h_stat = stats_map[("Heuristic", task_id)]
+            l_stat = stats_map[("LLM", task_id)]
+            
+            p_var = (((h_stat["n"] - 1) * (h_stat["std"] ** 2)) + ((l_stat["n"] - 1) * (l_stat["std"] ** 2))) / (h_stat["n"] + l_stat["n"] - 2)
+            p_std = math.sqrt(p_var) if p_var > 0 else 0.0
+            cohens_d = abs(h_stat["mean"] - l_stat["mean"]) / p_std if p_std > 0 else 0.0
+            
+            is_discrim = cohens_d > 0.8
+            all_discriminative = all_discriminative and is_discrim
+            
+            agent_separation.append({
+                "task_id": task_id,
+                "comparison": "Heuristic vs LLM",
+                "cohens_d": round(cohens_d, 4),
+                "is_discriminative": is_discrim
+            })
+            
+            verdict = "✅ SEPARATED" if is_discrim else "⚠️ WEAK SEPARATION"
+            print(f"Task {task_id}: Heuristic vs LLM      -> Cohen's d = {cohens_d:.2f} ({verdict})", file=sys.stderr)
+
+    overall_verdict = "✅ ENVIRONMENT IS DISCRIMINATIVE" if all_discriminative else "❌ WARNING: AGENTS ARE NOT WELL-SEPARATED"
+    print(f"\nOVERALL VERDICT: {overall_verdict}\n", file=sys.stderr)
+
+    # Save artifact
+    artifact = {
+        "metadata": {
+            "seeds_per_task": n_seeds,
+            "timestamp": datetime.datetime.now().isoformat()
+        },
+        "results": json_results,
+        "agent_separation": agent_separation,
+        "overall_verdict": overall_verdict
+    }
+    with open("benchmark_results.json", "w") as f:
+        json.dump(artifact, f, indent=2)
+    print("Saved exhaustive benchmark artifact to 'benchmark_results.json'.", file=sys.stderr)
 
     # Print the results in a format suitable for README
     print(f"\n{'='*80}")
     print(f" README BASELINE TABLE (copy-paste)")
     print(f"{'='*80}\n")
-    print(f"| Task | Evaluation Tier | Agent / Policy | Grader Score | Efficiency Score |")
-    print(f"| :--- | :--- | :--- | :---: | :---: |")
+    print(f"| Task | Evaluation Tier | Agent / Policy | Grader Score (μ ± σ) | 95% Confidence Interval | Efficiency |")
+    print(f"| :--- | :--- | :--- | :---: | :---: | :---: |")
 
     for task_id in TASKS:
         for agent in agents:
-            task_results = [
-                r for r in results
-                if r.agent_name == agent.name and r.task_id == task_id
-            ]
-            if not task_results:
+            if (agent.name, task_id) not in stats_map:
                 continue
-
-            scores = [r.score for r in task_results]
-            efficiencies = [r.efficiency for r in task_results]
-            mean_score = statistics.mean(scores)
-            mean_eff = statistics.mean(efficiencies)
-            std_score = statistics.stdev(scores) if len(scores) > 1 else 0.0
-
+            
+            stat = stats_map[(agent.name, task_id)]
             tier = "Random Baseline" if agent.name == "Random" else "Heuristic Baseline" if agent.name == "Heuristic" else "Reference LLM"
             task_label = {1: "Task 1 (Easy)", 2: "Task 2 (Med)", 3: "Task 3 (Hard)"}[task_id]
 
             print(
                 f"| **{task_label}** | {tier} | {agent.name} Agent | "
-                f"{mean_score:.3f} ± {std_score:.3f} | {mean_eff:.3f} |"
+                f"{stat['mean']:.3f} ± {stat['std']:.3f} | [{stat['ci_lower']:.3f}, {stat['ci_upper']:.3f}] | {stat['mean_eff']:.3f} |"
             )
 
 

@@ -9,7 +9,9 @@ htmlcov/
 .venv/
 venv/
 ENV/
+# Log files — includes server.log (1.4MB+) which must never be committed
 *.log
+server.log
 
 # --- Secrets & Config ---
 .env

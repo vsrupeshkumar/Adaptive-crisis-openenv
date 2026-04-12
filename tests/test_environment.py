@@ -53,11 +53,11 @@ def test_successful_zone_resolution():
     obs, _ = env.reset(seed=42)
     
     # Use exact required units for the first active zone
-    from env.reward import _get_required_fire, _get_required_ambulance
+    from env.reward import get_required_fire, get_required_ambulance
     active_zone_id, active_zone = next((z, s) for z, s in obs.zones.items() if s.fire != FireLevel.NONE)
     
-    req_fire = _get_required_fire(active_zone.fire, obs.weather)
-    req_amb = _get_required_ambulance(active_zone.patient)
+    req_fire = get_required_fire(active_zone.fire, obs.weather)
+    req_amb = get_required_ambulance(active_zone.patient)
     
     action = Action(allocations={
         active_zone_id: ZoneDispatch(dispatch_fire=req_fire, dispatch_ambulance=req_amb)

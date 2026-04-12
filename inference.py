@@ -104,7 +104,7 @@ from env.models import (
     ZoneDispatch,
     StructuralHallucinationError,
 )
-from env.reward import _get_required_fire, _get_required_ambulance
+from env.reward import get_required_fire, get_required_ambulance
 from metrics_tracker import MetricsTracker
 
 # ===========================================================================
@@ -733,8 +733,8 @@ def _compute_saliency(obs: Observation, action: Action) -> Dict[str, float]:
     This is NOT gradient-based (that requires differentiable models). Instead
     it provides a genuine, quantitative feature-attribution metric derived
     from the ratio between actual dispatch quantities and the computed
-    minimum requirements from ``env.reward._get_required_fire`` and
-    ``env.reward._get_required_ambulance``.
+    minimum requirements from ``env.reward.get_required_fire`` and
+    ``env.reward.get_required_ambulance``.
 
     The output is a flat dictionary of ``{zone.dimension_attribution: float}``
     entries suitable for structured logging and post-hoc analysis.
@@ -776,7 +776,7 @@ def _compute_saliency(obs: Observation, action: Action) -> Dict[str, float]:
         dispatch = action.allocations.get(zone_id, ZoneDispatch())
 
         # --- Fire Attribution ---
-        req_fire: int = _get_required_fire(zone_state.fire, obs.weather)
+        req_fire: int = get_required_fire(zone_state.fire, obs.weather)
         d_fire: int = dispatch.dispatch_fire
 
         if req_fire > 0:
@@ -792,7 +792,7 @@ def _compute_saliency(obs: Observation, action: Action) -> Dict[str, float]:
         saliency[f"{zone_id}.fire_attribution"] = fire_attr
 
         # --- Medical Attribution ---
-        req_amb: int = _get_required_ambulance(zone_state.patient)
+        req_amb: int = get_required_ambulance(zone_state.patient)
         d_amb: int = dispatch.dispatch_ambulance
 
         if req_amb > 0:

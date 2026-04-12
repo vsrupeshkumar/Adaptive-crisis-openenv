@@ -18,3 +18,10 @@ server = "server.app:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0.0"]
+
+[tool.pytest.ini_options]
+# Mathematical import resolution: sys.path.insert(0, rootdir)
+# ensures ∀ m ∈ {env, server} : import(m) succeeds from any CWD.
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
