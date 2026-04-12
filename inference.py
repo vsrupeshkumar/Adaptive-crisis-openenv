@@ -29,14 +29,17 @@ Entry Point
 """
 
 from __future__ import annotations
+import sys; print("[BOOT] inference.py started", flush=True); sys.stdout.flush()
+
+import os
+import sys
+import time
+import requests
 
 import argparse
 import json
 import logging
-import os
 import re
-import sys
-import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
@@ -73,26 +76,36 @@ if not API_KEY:
 # Optional - image name resolution for from_docker_image()
 IMAGE_NAME = os.getenv("IMAGE_NAME") or os.getenv("LOCAL_IMAGE_NAME")
 
-BASE_URL = os.getenv("API_BASE_URL", "http://localhost:7860")
-
-import time, requests, sys
-print("[INFO] Waiting for server...", flush=True)
-for attempt in range(30):
-    try:
-        r = requests.post(f"{BASE_URL}/reset", json={"task_id": 1}, timeout=5)
-        if r.status_code == 200:
-            print(f"[INFO] Server ready after {attempt+1}s", flush=True)
-            break
-    except Exception:
-        time.sleep(1)
-else:
-    print("[ERROR] Server not ready after 30s", flush=True)
+try:
+    import time, requests, sys
+    BASE_URL = os.getenv("API_BASE_URL", "http://localhost:7860")
+    print("[INFO] Starting inference.py", flush=True)
+    print(f"[INFO] BASE_URL = {BASE_URL}", flush=True)
+    for attempt in range(30):
+        try:
+            r = requests.post(
+                f"{BASE_URL}/reset",
+                json={"task_id": 1},
+                timeout=5
+            )
+            if r.status_code == 200:
+                print(f"[INFO] Server ready after {attempt+1}s", flush=True)
+                break
+        except Exception as e:
+            print(f"[INFO] Attempt {attempt+1}/30 failed: {e}", flush=True)
+            time.sleep(1)
+    else:
+        print("[ERROR] Server not ready after 30s", flush=True)
+        sys.exit(1)
+except Exception as e:
+    print(f"[FATAL] Pre-flight crash: {e}", flush=True)
+    import traceback
+    traceback.print_exc()
     sys.exit(1)
 
 # ---------------------------------------------------------------------------
 # Third-party imports
 # ---------------------------------------------------------------------------
-import requests
 from openai import APIConnectionError, APIStatusError, APITimeoutError
 from pydantic import ValidationError
 
