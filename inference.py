@@ -1,3 +1,8 @@
+import sys, os
+sys.stdout.write("[BOOT] inference.py started\n")
+sys.stdout.flush()
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 """
 inference.py
 ============
@@ -27,10 +32,6 @@ Entry Point
     python inference.py          # runs all three tasks sequentially
     python inference.py --task 2 # runs a specific task only
 """
-
-from __future__ import annotations
-import sys; print("[BOOT] inference.py started", flush=True); sys.stdout.flush()
-
 import os
 import sys
 import time
