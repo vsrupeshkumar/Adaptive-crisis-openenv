@@ -79,7 +79,7 @@ IMAGE_NAME = os.getenv("IMAGE_NAME") or os.getenv("LOCAL_IMAGE_NAME")
 
 try:
     import time, requests, sys
-    BASE_URL = os.getenv("API_BASE_URL", "http://localhost:7860")
+    BASE_URL = os.getenv("BASE_URL", "http://localhost:7860")
     print("[INFO] Starting inference.py", flush=True)
     print(f"[INFO] BASE_URL = {BASE_URL}", flush=True)
     MAX_WAIT_ATTEMPTS = 90
@@ -97,6 +97,10 @@ try:
                 print(f"[INFO] Server ready after "
                       f"{(attempt+1) * RETRY_SLEEP}s", flush=True)
                 break
+            else:
+                if attempt % 10 == 0:
+                    print(f"[WARN] Server returned {r.status_code}, waiting...", flush=True)
+                time.sleep(RETRY_SLEEP)
         except Exception as e:
             if attempt % 10 == 0:
                 print(f"[INFO] Still waiting... attempt "
