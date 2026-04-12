@@ -54,11 +54,11 @@ Where:
 ### The Reward Function ($R$)
 Agentic dispatch decisions are graded on a dense multi-objective reward function evaluated at every step. We implement a strict temporal discount factor of **$\gamma = 0.99$**. A $\gamma$ value of $0.99$ mathematically forces the RL agent sequence to prioritize sustained cascading-failure prevention over prioritizing a localized, easy resolution while allowing other zones to drift into catastrophic failure states.
 
-$$R_t(s, a) = \gamma^{t} \cdot \left( R_{\text{dispatch}} + R_{\text{NLP}} - R_{\text{waste}} + R_{\text{efficiency}} - R_{\text{time}} + R_{\text{multi\_obj}} \right)$$
+$$R_t(s, a) = \gamma^{t} \cdot \left( R_{\text{dispatch}} + R_{\text{NLP}} - R_{\text{waste}} + R_{\text{efficiency}} - R_{\text{time}} + R_{\text{multi-obj}} \right)$$
 
 Where each term is defined in `env/reward.py` and the final episodic score is computed by the three-component grader:
 
-$$\text{score} = 0.50 \times \text{success\_rate} + 0.30 \times \text{efficiency} + 0.20 \times \text{resource\_usage}$$
+$$\text{score} = 0.50 \times \text{success rate} + 0.30 \times \text{efficiency} + 0.20 \times \text{resource usage}$$
 
 ### Visualizing the State-Transition Loop
 ```mermaid
@@ -148,7 +148,7 @@ Five zones (Downtown, Suburbs, Industrial, **Harbor**, **Residential**) simultan
 
 For Task 2 and Task 3, the environment implements **in-episode adaptive difficulty escalation**. If the agent performs consistently well over a rolling 5-step window, the environment automatically increases difficulty:
 
-$$\text{If } \bar{R}_{t-5:t} > 0.7 \implies \begin{cases} \text{Resources} \leftarrow \lfloor 0.8 \times \text{Resources} \rfloor \\ \text{NewCrisis} \leftarrow \text{spawn}(\text{clear\_zone}) \end{cases}$$
+$$\text{If } \bar{R}_{t-5:t} > 0.7 \implies \begin{cases} \text{Resources} \leftarrow \lfloor 0.8 \times \text{Resources} \rfloor \\ \text{NewCrisis} \leftarrow \text{spawn}(\text{clear zone}) \end{cases}$$
 
 A 5-step cooldown prevents over-punishment. This forces agents to demonstrate sustained planning ability rather than one-shot solutions.
 
