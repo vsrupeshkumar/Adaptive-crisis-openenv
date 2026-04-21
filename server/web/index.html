@@ -1,184 +1,38 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta name="description" content="Adaptive Crisis Management Environment — Interactive monitoring dashboard for real-time RL environment inspection and manual dispatch control.">
-    <title>Crisis Dashboard | Adaptive Crisis Env</title>
-    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🚨</text></svg>">
-    <link rel="stylesheet" href="style.css">
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ACME Ops — Adaptive Crisis Management</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&family=Instrument+Serif&display=swap">
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="styles-ext.css">
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+<script>
+// Persisted tweaks live between these markers so changes survive reload.
+window.TWEAK_DEFAULTS = /*EDITMODE-BEGIN*/{
+  "theme": "dark",
+  "density": "comfortable",
+  "task": 3,
+  "animations": "subtle",
+  "cvdSafe": false,
+  "mapStyle": "hex",
+  "expertView": true,
+  "seed": 42
+}/*EDITMODE-END*/;
+</script>
 </head>
 <body>
-    <header id="app-header">
-        <div class="header-content">
-            <h1>
-                <svg class="header-icon" viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="2">
-                    <path d="M12 2L2 7l10 5 10-5-10-5z"/>
-                    <path d="M2 17l10 5 10-5"/>
-                    <path d="M2 12l10 5 10-5"/>
-                </svg>
-                Adaptive Crisis Management Environment
-            </h1>
-            <div class="header-right">
-                <span class="conn-dot" id="conn-dot" title="Server status"></span>
-                <span class="version-badge" id="version-badge">v4.1.0</span>
-                <span class="kbd-hint" title="Keyboard shortcuts: R=Reset, Space=Step, 1/2/3=Task, A=Auto-Play">⌨</span>
-            </div>
-        </div>
-    </header>
-
-    <main id="app-main">
-        <!-- Top Row: Control Panel + Zone Heatmap -->
-        <div class="top-row">
-            <aside class="card control-panel" id="control-panel">
-                <h2 class="card-title">Control Panel</h2>
-                <div class="control-group">
-                    <label for="task-select">Task Difficulty</label>
-                    <div class="btn-group" id="task-select">
-                        <button class="btn-task active" data-task="1" id="btn-task-1">Easy <kbd>1</kbd></button>
-                        <button class="btn-task" data-task="2" id="btn-task-2">Medium <kbd>2</kbd></button>
-                        <button class="btn-task" data-task="3" id="btn-task-3">Hard <kbd>3</kbd></button>
-                    </div>
-                </div>
-                <div class="control-group">
-                    <label for="seed-input">Random Seed</label>
-                    <input type="number" id="seed-input" class="input-field" value="42" min="0" max="99999" placeholder="42">
-                </div>
-                <div class="control-actions">
-                    <button class="btn btn-primary" id="btn-reset">
-                        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 4v6h6"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>
-                        Reset <kbd>R</kbd>
-                    </button>
-                    <button class="btn btn-accent" id="btn-step" disabled>
-                        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
-                        Dispatch <kbd>⎵</kbd>
-                    </button>
-                </div>
-                <div class="control-actions">
-                    <button class="btn btn-autoplay" id="btn-autoplay" disabled>
-                        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/><line x1="19" y1="3" x2="19" y2="21"/></svg>
-                        Auto-Play <kbd>A</kbd>
-                    </button>
-                </div>
-
-                <div class="session-info" id="session-info">
-                    <div class="info-row">
-                        <span class="info-label">Status</span>
-                        <span class="info-value status-idle" id="status-indicator">Idle</span>
-                    </div>
-                    <div class="info-row">
-                        <span class="info-label">Step</span>
-                        <span class="info-value" id="step-counter">0 / —</span>
-                    </div>
-                    <div class="info-row">
-                        <span class="info-label">Score</span>
-                        <span class="info-value" id="score-display">0.000</span>
-                    </div>
-                    <div class="info-row">
-                        <span class="info-label">Weather</span>
-                        <span class="info-value" id="weather-display">—</span>
-                    </div>
-                    <div class="info-row">
-                        <span class="info-label">Cumulative R</span>
-                        <span class="info-value" id="cumulative-reward">0.00</span>
-                    </div>
-                </div>
-            </aside>
-
-            <section class="card zone-heatmap" id="zone-heatmap">
-                <h2 class="card-title">Zone Heatmap</h2>
-                <div class="zone-grid" id="zone-grid">
-                    <div class="zone-placeholder">Reset environment to view zones</div>
-                </div>
-            </section>
-        </div>
-
-        <!-- Middle Row: Resource Gauges + Dispatch Panel -->
-        <div class="middle-row">
-            <aside class="card resource-panel" id="resource-panel">
-                <h2 class="card-title">Resources</h2>
-                <div class="gauge-container" id="gauge-container">
-                    <div class="gauge-item">
-                        <div class="gauge-header">
-                            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="#ef4444" stroke-width="2"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2z"/><path d="M8 12h8"/><path d="M12 8v8"/></svg>
-                            <span>Fire Units</span>
-                        </div>
-                        <div class="gauge-bar"><div class="gauge-fill fire-fill" id="gauge-fire" style="width:0%"></div></div>
-                        <div class="gauge-label"><span id="fire-idle">0</span> idle / <span id="fire-busy">0</span> busy</div>
-                    </div>
-                    <div class="gauge-item">
-                        <div class="gauge-header">
-                            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="#3b82f6" stroke-width="2"><path d="M4.8 2.3A.3.3 0 1 0 5 2H4a2 2 0 0 0-2 2v5a6 6 0 0 0 6 6v0a6 6 0 0 0 6-6V4a2 2 0 0 0-2-2h-1a.2.2 0 1 0 .3.3"/><path d="M8 15v1a6 6 0 0 0 6 6h0a6 6 0 0 0 6-6v-4"/></svg>
-                            <span>Ambulances</span>
-                        </div>
-                        <div class="gauge-bar"><div class="gauge-fill amb-fill" id="gauge-amb" style="width:0%"></div></div>
-                        <div class="gauge-label"><span id="amb-idle">0</span> idle / <span id="amb-busy">0</span> busy</div>
-                    </div>
-                    <div class="gauge-item">
-                        <div class="gauge-header">
-                            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="#a855f7" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
-                            <span>Police</span>
-                        </div>
-                        <div class="gauge-bar"><div class="gauge-fill pol-fill" id="gauge-pol" style="width:0%"></div></div>
-                        <div class="gauge-label"><span id="pol-idle">0</span> idle / <span id="pol-busy">0</span> busy</div>
-                    </div>
-                </div>
-            </aside>
-
-            <section class="card dispatch-panel" id="dispatch-panel">
-                <h2 class="card-title">Dispatch Orders</h2>
-                <div class="dispatch-zones" id="dispatch-zones">
-                    <div class="zone-placeholder">Reset environment to configure dispatches</div>
-                </div>
-                <div class="broadcast-group">
-                    <label for="broadcast-input">Public Broadcast Message</label>
-                    <textarea id="broadcast-input" class="input-field broadcast-textarea" rows="2" placeholder="ALERT: [Zone] has a [severity] [hazard]. All residents must [action] immediately."></textarea>
-                </div>
-            </section>
-        </div>
-
-        <!-- Saliency Attribution Row -->
-        <div class="saliency-row">
-            <section class="card saliency-panel" id="saliency-panel">
-                <h2 class="card-title">Saliency Attribution <span class="card-subtitle">— Dispatch-Requirement Ratio (DRR)</span></h2>
-                <div class="saliency-content" id="saliency-content">
-                    <div class="zone-placeholder">Send a dispatch to see feature attribution analysis</div>
-                </div>
-            </section>
-        </div>
-
-        <!-- Bottom Row: Sparkline + Action Log -->
-        <div class="bottom-row">
-            <section class="card sparkline-panel" id="sparkline-panel">
-                <h2 class="card-title">Reward Trajectory</h2>
-                <div class="sparkline-container">
-                    <canvas id="reward-canvas" width="700" height="120"></canvas>
-                    <div class="sparkline-stats">
-                        <span>Score: <strong id="spark-score">0.000</strong></span>
-                        <span>Efficiency: <strong id="spark-efficiency">0.000</strong></span>
-                        <span>Last Reward: <strong id="spark-last-reward">—</strong></span>
-                    </div>
-                </div>
-            </section>
-
-            <section class="card log-panel" id="log-panel">
-                <h2 class="card-title">Action Log</h2>
-                <div class="log-container" id="log-container">
-                    <div class="log-entry log-info">Dashboard ready. Select a task and click Reset to begin.</div>
-                </div>
-            </section>
-        </div>
-    </main>
-
-    <!-- Episode Summary Modal -->
-    <div class="modal-overlay" id="episode-modal" style="display:none">
-        <div class="modal-card">
-            <h2 class="modal-title">📊 Episode Summary</h2>
-            <div class="modal-body" id="modal-body"></div>
-            <button class="btn btn-primary modal-close" id="modal-close">Close & Reset</button>
-        </div>
-    </div>
-
-    <script src="app.js"></script>
+<div id="root"></div>
+<script type="text/babel" data-presets="react" src="sim.js"></script>
+<script type="text/babel" data-presets="react" src="components.jsx"></script>
+<script type="text/babel" data-presets="react" src="map.jsx"></script>
+<script type="text/babel" data-presets="react" src="panels.jsx"></script>
+<script type="text/babel" data-presets="react" src="tweaks.jsx"></script>
+<script type="text/babel" data-presets="react" src="app.jsx"></script>
 </body>
 </html>
